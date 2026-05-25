@@ -49,6 +49,7 @@ type TrojanOption struct {
 	PrivateKey        string         `proxy:"private-key,omitempty"`
 	UDP               bool           `proxy:"udp,omitempty"`
 	Network           string         `proxy:"network,omitempty"`
+	SkipTLS           bool           `proxy:"skip-tls,omitempty"`
 	ECHOpts           ECHOptions     `proxy:"ech-opts,omitempty"`
 	RealityOpts       RealityOptions `proxy:"reality-opts,omitempty"`
 	GrpcOpts          GrpcOptions    `proxy:"grpc-opts,omitempty"`
@@ -119,21 +120,23 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 	default:
 		// default tcp network
 		// handle TLS
-		alpn := trojan.DefaultALPN
-		if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
-			alpn = t.option.ALPN
+		if !t.option.SkipTLS {
+			alpn := trojan.DefaultALPN
+			if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
+				alpn = t.option.ALPN
+			}
+			c, err = vmess.StreamTLSConn(ctx, c, &vmess.TLSConfig{
+				Host:              t.option.SNI,
+				SkipCertVerify:    t.option.SkipCertVerify,
+				FingerPrint:       t.option.Fingerprint,
+				Certificate:       t.option.Certificate,
+				PrivateKey:        t.option.PrivateKey,
+				ClientFingerprint: t.option.ClientFingerprint,
+				NextProtos:        alpn,
+				ECH:               t.echConfig,
+				Reality:           t.realityConfig,
+			})
 		}
-		c, err = vmess.StreamTLSConn(ctx, c, &vmess.TLSConfig{
-			Host:              t.option.SNI,
-			SkipCertVerify:    t.option.SkipCertVerify,
-			FingerPrint:       t.option.Fingerprint,
-			Certificate:       t.option.Certificate,
-			PrivateKey:        t.option.PrivateKey,
-			ClientFingerprint: t.option.ClientFingerprint,
-			NextProtos:        alpn,
-			ECH:               t.echConfig,
-			Reality:           t.realityConfig,
-		})
 	}
 	if err != nil {
 		return nil, err
