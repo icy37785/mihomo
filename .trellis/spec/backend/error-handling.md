@@ -1,51 +1,82 @@
 # Error Handling
 
-> How errors are handled in this project.
+This project uses plain Go `error` values, contextual wrapping, and small route-level JSON error objects. Keep errors close to the boundary that can add useful context.
 
----
+## Parse And Validation Errors
 
-## Overview
+Config and parser errors should include enough context to locate the failing config item:
 
-<!--
-Document your project's error handling conventions here.
+- `adapter.ParseProxy` returns direct protocol decode/create errors and reports unsupported types as `unsupport proxy type: <type>`.
+- `config.parseProxies` wraps proxy errors with index context: `proxy %d: %w`.
+- `config.parseRules` includes section, index, raw line, and parser error: `%s[%d] [%s] error: %s`.
+- `rules.ParseRule` validates missing payloads and unsupported rule types before returning a concrete matcher.
 
-Questions to answer:
-- What error types do you define?
-- How are errors propagated?
-- How are errors logged?
-- How are errors returned to clients?
--->
+Reference files:
+- `adapter/parser.go`
+- `config/config.go`
+- `config/utils.go`
+- `rules/parser.go`
+- `rules/common/base.go`
 
-(To be filled by the team)
+Use `%w` when callers may need the original error. Use `%s`/`Error()` only when preserving identity is not useful and the local message is the contract.
 
----
+## Runtime Errors
 
-## Error Types
+- Startup failures that make the process unusable call `log.Fatalln` from `main.go`.
+- Reload failures return errors to `hub.Parse` callers or API responses; do not terminate the process on SIGHUP or REST config update failure.
+- Long-running listeners log errors and return from their goroutine when a listener cannot start or serve.
+- Tunnel packet/connection handling should drop invalid traffic and log at `Debugln` or `Warnln` depending on operator actionability.
 
-<!-- Custom error classes/types -->
+Examples:
+- `main.go` uses fatal logging for initial config and post-up failures.
+- `hub/route/server.go` logs external controller listen/serve errors.
+- `tunnel/tunnel.go` drops invalid UDP packets and logs invalid metadata.
 
-(To be filled by the team)
+## External Controller Errors
 
----
+HTTP API errors are JSON objects with a single `message` field:
 
-## Error Handling Patterns
+```go
+type HTTPError struct {
+	Message string `json:"message"`
+}
+```
 
-<!-- Try-catch patterns, error propagation -->
+Reference file: `hub/route/errors.go`.
 
-(To be filled by the team)
+Route handlers should:
 
----
+- call `render.Status(r, <status>)` before rendering an error when the status is not 200;
+- use shared errors (`ErrBadRequest`, `ErrUnauthorized`, `ErrNotFound`) for common cases;
+- use `newError(err.Error())` for operation-specific messages;
+- return immediately after rendering an error.
 
-## API Error Responses
+Example pattern from config update routes:
 
-<!-- Standard error response format -->
+```go
+if err := render.DecodeJSON(r.Body, &req); err != nil {
+	render.Status(r, http.StatusBadRequest)
+	render.JSON(w, r, ErrBadRequest)
+	return
+}
+```
 
-(To be filled by the team)
+## Validation Matrix
 
----
+| Condition | Error behavior |
+| --- | --- |
+| Config file missing or empty | return error from `executor.ParseWithPath` / `readConfig` |
+| Invalid YAML | return from `config.UnmarshalRawConfig` |
+| Proxy type missing | `adapter.ParseProxy` returns `missing type` |
+| Proxy/group/provider reference missing | config parser returns contextual `not found` error |
+| Circular `dialer-proxy` | `validateDialerProxies` returns circular dependency error |
+| API body decode failure | `400` with `ErrBadRequest` |
+| Unsafe config path through API | `400` with `ErrNotSafePath` message |
+| Geo database update failure | log error and return `500` JSON error |
 
 ## Common Mistakes
 
-<!-- Error handling mistakes your team has made -->
-
-(To be filled by the team)
+- Do not log and swallow config parse errors. Return them to the caller so startup, test-config mode, or route handlers can decide how to surface them.
+- Do not call `log.Fatalln` from parser, adapter, tunnel, or route helpers. Reserve fatal exits for process startup boundaries.
+- Do not return plain `ErrBadRequest` when a user needs a specific actionable message such as unsafe path or parse failure.
+- Do not continue after `render.JSON` error responses; route handlers should return immediately.
