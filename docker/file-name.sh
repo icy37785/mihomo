@@ -2,7 +2,7 @@
 os="mihomo-linux-"
 case $TARGETPLATFORM in
     "linux/amd64")
-        arch="amd64-v1"
+        arch="amd64-v3"
         ;;
     "linux/386")
         arch="386"
