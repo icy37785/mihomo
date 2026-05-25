@@ -117,6 +117,7 @@ type ProxyInfo struct {
 	RoutingMark  int
 	ProviderName string
 	DialerProxy  string
+	Hidden       bool
 }
 
 type ProxyAdapter interface {

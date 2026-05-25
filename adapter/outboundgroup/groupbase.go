@@ -217,6 +217,17 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 		proxies = newProxies
 	}
 
+	if len(proxies) > 0 {
+		var newProxies []C.Proxy
+		for _, p := range proxies {
+			if p.ProxyInfo().Hidden {
+				continue
+			}
+			newProxies = append(newProxies, p)
+		}
+		proxies = newProxies
+	}
+
 	if len(proxies) == 0 {
 		return []C.Proxy{tunnel.Proxies()["COMPATIBLE"]}
 	}

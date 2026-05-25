@@ -5,6 +5,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -17,9 +18,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 
 	opt := applyProxyOptions(options...)
 	basicOption := outbound.BasicOption{
-		DialerForAPI: opt.DialerForAPI,
-		TunnelForAPI: opt.TunnelForAPI,
-		ProviderName: opt.ProviderName,
+		DialerForAPI:        opt.DialerForAPI,
+		TunnelForAPI:        opt.TunnelForAPI,
+		ProviderName:        opt.ProviderName,
+		DialerProxyResolver: opt.DialerProxyResolver,
 	}
 
 	var (
@@ -217,14 +219,24 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		}
 	}
 
+	proxyMetadata := &proxyMetadataOption{}
+	if err := decoder.Decode(mapping, proxyMetadata); err != nil {
+		return nil, err
+	}
+
 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
-	return NewProxy(proxy), nil
+	return NewProxy(proxy, proxyMetadata.Hidden), nil
+}
+
+type proxyMetadataOption struct {
+	Hidden bool `proxy:"hidden,omitempty"`
 }
 
 type proxyOption struct {
-	DialerForAPI C.Dialer
-	TunnelForAPI C.Tunnel
-	ProviderName string
+	DialerForAPI        C.Dialer
+	TunnelForAPI        C.Tunnel
+	ProviderName        string
+	DialerProxyResolver proxydialer.ProxyResolver
 }
 
 func applyProxyOptions(options ...ProxyOption) proxyOption {
@@ -252,5 +264,11 @@ func WithTunnelForAPI(tunnel C.Tunnel) ProxyOption {
 func WithProviderName(name string) ProxyOption {
 	return func(opt *proxyOption) {
 		opt.ProviderName = name
+	}
+}
+
+func WithDialerProxyResolver(resolver proxydialer.ProxyResolver) ProxyOption {
+	return func(opt *proxyOption) {
+		opt.DialerProxyResolver = resolver
 	}
 }

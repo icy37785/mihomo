@@ -37,6 +37,7 @@ type Proxy struct {
 	alive   atomic.Bool
 	history *queue.Queue[C.DelayHistory]
 	extra   xsync.Map[string, *internalProxyState]
+	hidden  bool
 }
 
 // Adapter implements C.Proxy
@@ -63,6 +64,13 @@ func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 func (p *Proxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata)
 	return pc, err
+}
+
+// ProxyInfo implements C.ProxyAdapter
+func (p *Proxy) ProxyInfo() C.ProxyInfo {
+	info := p.ProxyAdapter.ProxyInfo()
+	info.Hidden = info.Hidden || p.hidden
+	return info
 }
 
 // DelayHistory implements C.Proxy
@@ -158,6 +166,9 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["routing-mark"] = proxyInfo.RoutingMark
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
+	if proxyInfo.Hidden {
+		mapping["hidden"] = true
+	}
 
 	return json.Marshal(mapping)
 }
@@ -279,11 +290,16 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	return
 }
 
-func NewProxy(adapter C.ProxyAdapter) *Proxy {
+func NewProxy(adapter C.ProxyAdapter, hidden ...bool) *Proxy {
+	var isHidden bool
+	if len(hidden) > 0 {
+		isHidden = hidden[0]
+	}
 	return &Proxy{
 		ProxyAdapter: adapter,
 		history:      queue.New[C.DelayHistory](defaultHistoriesNum),
 		alive:        atomic.NewBool(true),
+		hidden:       isHidden,
 	}
 }
 

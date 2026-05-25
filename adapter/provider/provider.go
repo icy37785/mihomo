@@ -11,6 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/convert"
+	"github.com/metacubex/mihomo/common/structure"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
@@ -48,6 +49,28 @@ type baseProvider struct {
 	proxies     []C.Proxy
 	healthCheck *HealthCheck
 	version     uint32
+}
+
+type proxyResolverStore struct {
+	mutex   sync.RWMutex
+	proxies map[string]C.Proxy
+}
+
+func newProxyResolverStore() *proxyResolverStore {
+	return &proxyResolverStore{proxies: map[string]C.Proxy{}}
+}
+
+func (prs *proxyResolverStore) Resolve(name string) (C.Proxy, bool) {
+	prs.mutex.RLock()
+	defer prs.mutex.RUnlock()
+	proxy, ok := prs.proxies[name]
+	return proxy, ok
+}
+
+func (prs *proxyResolverStore) Set(proxies map[string]C.Proxy) {
+	prs.mutex.Lock()
+	defer prs.mutex.Unlock()
+	prs.proxies = proxies
 }
 
 func (bp *baseProvider) Name() string {
@@ -357,12 +380,52 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 	}
 
 	var filterRegs []*regexp2.Regexp
-	for _, filter := range strings.Split(filter, "`") {
-		filterReg, err := regexp2.Compile(filter, regexp2.None)
-		if err != nil {
-			return nil, fmt.Errorf("invalid filter regex: %w", err)
+	if filter != "" {
+		for _, filter := range strings.Split(filter, "`") {
+			filterReg, err := regexp2.Compile(filter, regexp2.None)
+			if err != nil {
+				return nil, fmt.Errorf("invalid filter regex: %w", err)
+			}
+			filterRegs = append(filterRegs, filterReg)
 		}
-		filterRegs = append(filterRegs, filterReg)
+	}
+
+	type proxyEntry struct {
+		rawName string
+		proxy   C.Proxy
+	}
+
+	proxyResolver := newProxyResolverStore()
+	metadataDecoder := structure.NewDecoder(structure.Option{TagName: "proxy", WeaklyTypedInput: true, KeyReplacer: structure.DefaultKeyReplacer})
+
+	proxyHidden := func(mapping map[string]any) (bool, error) {
+		metadata := &struct {
+			Hidden bool `proxy:"hidden,omitempty"`
+		}{}
+		if err := metadataDecoder.Decode(mapping, metadata); err != nil {
+			return false, err
+		}
+		return metadata.Hidden, nil
+	}
+
+	matchesFilter := func(name string) bool {
+		if len(filterRegs) == 0 {
+			return true
+		}
+		for _, filterReg := range filterRegs {
+			if mat, _ := filterReg.MatchString(name); mat {
+				return true
+			}
+		}
+		return false
+	}
+
+	cloneMapping := func(mapping map[string]any) map[string]any {
+		cloned := make(map[string]any, len(mapping))
+		for key, value := range mapping {
+			cloned[key] = value
+		}
+		return cloned
 	}
 
 	return func(buf []byte) ([]C.Proxy, error) {
@@ -380,66 +443,98 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 			return nil, errors.New("file must have a `proxies` field")
 		}
 
-		proxies := []C.Proxy{}
+		entries := []proxyEntry{}
+		localProxies := map[string]C.Proxy{}
 		proxiesSet := map[string]struct{}{}
-		for _, filterReg := range filterRegs {
-		LOOP1:
-			for idx, mapping := range schema.Proxies {
-				if len(excludeTypeArray) > 0 {
-					mType, ok := mapping["type"]
-					if !ok {
-						continue
-					}
-					pType, ok := mType.(string)
-					if !ok {
-						continue
-					}
-					for _, excludeType := range excludeTypeArray {
-						if strings.EqualFold(pType, excludeType) {
-							continue LOOP1
-						}
-					}
-				}
-				mName, ok := mapping["name"]
+	LOOP1:
+		for idx, mapping := range schema.Proxies {
+			if len(excludeTypeArray) > 0 {
+				mType, ok := mapping["type"]
 				if !ok {
 					continue
 				}
-				name, ok := mName.(string)
+				pType, ok := mType.(string)
 				if !ok {
 					continue
 				}
-				if len(excludeFilterRegs) > 0 {
-					for _, excludeFilterReg := range excludeFilterRegs {
-						if mat, _ := excludeFilterReg.MatchString(name); mat {
-							continue LOOP1
-						}
+				for _, excludeType := range excludeTypeArray {
+					if strings.EqualFold(pType, excludeType) {
+						continue LOOP1
 					}
 				}
-				if len(filter) > 0 {
-					if mat, _ := filterReg.MatchString(name); !mat {
-						continue
+			}
+			mName, ok := mapping["name"]
+			if !ok {
+				continue
+			}
+			name, ok := mName.(string)
+			if !ok {
+				continue
+			}
+			if len(excludeFilterRegs) > 0 {
+				for _, excludeFilterReg := range excludeFilterRegs {
+					if mat, _ := excludeFilterReg.MatchString(name); mat {
+						continue LOOP1
 					}
 				}
-				if _, ok := proxiesSet[name]; ok {
+			}
+			hidden, err := proxyHidden(mapping)
+			if err != nil {
+				return nil, fmt.Errorf("proxy %d hidden error: %w", idx, err)
+			}
+			if !hidden && !matchesFilter(name) {
+				continue
+			}
+			if _, ok := proxiesSet[name]; ok {
+				continue
+			}
+
+			cloned := cloneMapping(mapping)
+			if len(dialerProxy) > 0 {
+				cloned["dialer-proxy"] = dialerProxy
+			}
+
+			err = override.Apply(cloned)
+			if err != nil {
+				return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
+			}
+
+			proxy, err := adapter.ParseProxy(cloned, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName), adapter.WithDialerProxyResolver(proxyResolver.Resolve))
+			if err != nil {
+				return nil, fmt.Errorf("proxy %d error: %w", idx, err)
+			}
+
+			proxiesSet[name] = struct{}{}
+			if _, ok := localProxies[proxy.Name()]; !ok {
+				localProxies[proxy.Name()] = proxy
+			}
+			entries = append(entries, proxyEntry{rawName: name, proxy: proxy})
+		}
+
+		proxies := []C.Proxy{}
+		visibleSet := map[string]struct{}{}
+		if len(filterRegs) == 0 {
+			for _, entry := range entries {
+				if entry.proxy.ProxyInfo().Hidden {
 					continue
 				}
-
-				if len(dialerProxy) > 0 {
-					mapping["dialer-proxy"] = dialerProxy
+				proxies = append(proxies, entry.proxy)
+			}
+		} else {
+			for _, filterReg := range filterRegs {
+				for _, entry := range entries {
+					if _, ok := visibleSet[entry.rawName]; ok {
+						continue
+					}
+					if mat, _ := filterReg.MatchString(entry.rawName); !mat {
+						continue
+					}
+					if entry.proxy.ProxyInfo().Hidden {
+						continue
+					}
+					visibleSet[entry.rawName] = struct{}{}
+					proxies = append(proxies, entry.proxy)
 				}
-
-				err := override.Apply(mapping)
-				if err != nil {
-					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
-				}
-
-				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
-				if err != nil {
-					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
-				}
-
-				proxiesSet[name] = struct{}{}
-				proxies = append(proxies, proxy)
 			}
 		}
 
@@ -450,6 +545,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 			return nil, errors.New("file doesn't have any proxy")
 		}
 
+		proxyResolver.Set(localProxies)
 		return proxies, nil
 	}, nil
 }
