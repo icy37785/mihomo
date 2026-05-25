@@ -142,6 +142,7 @@ rtk go test ./...
 
 ### 2. Signatures
 - Active matrix entries live in `.github/workflows/build.yml` under `jobs.build.strategy.matrix.jobs`.
+- Active standalone test entries live in `.github/workflows/test.yml` under `jobs.test.strategy.matrix.os` and `jobs.test.strategy.matrix.go-version`.
 - Docker artifact selection for `linux/amd64` lives in `docker/file-name.sh`.
 - The Docker `linux/amd64` selector must resolve to `amd64-v3`.
 
@@ -149,6 +150,7 @@ rtk go test ./...
 - Keep inactive matrix entries commented, not deleted, so future user-requested targets can be restored deliberately.
 - Every active matrix object must declare all optional fields referenced by workflow expressions (`goversion`, `abi`, `ndk`, `go386`, `goarm`, `gomips`, `debian`, `rpm`, `pacman`, `tarball`, `test`) even when the value is `''`.
 - Docker platforms must match available Linux artifacts. With only `linux/amd64-v3` enabled, Docker `platforms` must only include `linux/amd64`.
+- Standalone CI tests should mirror the active self-use targets: keep `ubuntu-latest` and `macos-latest` active, keep the current default Go version active, and leave inactive OS/Go versions commented for future restoration.
 - If additional Linux architectures are re-enabled, update both the build matrix and Docker artifact selector in the same change.
 
 ### 4. Validation & Error Matrix
@@ -157,23 +159,28 @@ rtk go test ./...
 | `actionlint` reports undefined `matrix.jobs.<field>` | Add the optional field to every active matrix object. |
 | Docker references a platform without a matching build artifact | Disable that Docker platform or re-enable the matching artifact. |
 | `docker/file-name.sh` selects `amd64-v1` while matrix builds `amd64-v3` | Change the selector to `amd64-v3`. |
+| `.github/workflows/test.yml` still tests disabled OS targets or old Go versions | Comment those matrix entries until the matching build targets are re-enabled. |
 | Workflow YAML parses but `actionlint` fails | Treat the workflow as invalid until `actionlint` passes. |
 
 ### 5. Good/Base/Bad Cases
 - Good: active matrix contains only Linux `amd64-v3` and Darwin `arm64`, with all optional fields present.
 - Base: Docker builds only `linux/amd64` and `docker/file-name.sh` selects `amd64-v3`.
+- Base: standalone tests run only `ubuntu-latest` and `macos-latest` on the active default Go version.
 - Bad: commenting out matrix entries but leaving Docker platforms `linux/386`, `linux/arm64`, or `linux/arm/v7` enabled.
+- Bad: limiting release builds but still running the standalone test matrix across Windows, Linux ARM, macOS Intel, and old Go versions.
 - Bad: relying on missing matrix keys to evaluate as empty strings; `actionlint` rejects this.
 
 ### 6. Tests Required
 - Workflow lint:
-  ```bash
-  rtk actionlint .github/workflows/build.yml
-  ```
+```bash
+rtk actionlint .github/workflows/build.yml
+rtk actionlint .github/workflows/test.yml
+```
 - YAML parse check:
-  ```bash
-  rtk ruby -e 'require "yaml"; YAML.load_file(".github/workflows/build.yml"); puts "workflow yaml ok"'
-  ```
+```bash
+rtk ruby -e 'require "yaml"; YAML.load_file(".github/workflows/build.yml"); puts "workflow yaml ok"'
+rtk ruby -e 'require "yaml"; YAML.load_file(".github/workflows/test.yml"); puts "workflow yaml ok"'
+```
 - Docker helper syntax:
   ```bash
   rtk sh -n docker/file-name.sh
@@ -192,6 +199,28 @@ rtk go test ./...
 #### Correct
 ```yaml
 - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3, test: test, goversion: '', abi: '', ndk: '', go386: '', goarm: '', gomips: '', debian: '', rpm: '', pacman: '', tarball: '' }
+```
+
+#### Wrong
+```yaml
+os:
+  - 'ubuntu-latest'
+  - 'windows-latest'
+  - 'macos-latest'
+go-version:
+  - '1.26'
+  - '1.25'
+```
+
+#### Correct
+```yaml
+os:
+  - 'ubuntu-latest'
+  - 'macos-latest'
+  # - 'windows-latest'
+go-version:
+  - '1.26'
+  # - '1.25'
 ```
 
 ## Code Review Checklist

@@ -24,7 +24,7 @@ This repository is a Go single-module backend/proxy runtime. These specs documen
 
 - Run focused package tests for the changed area.
 - Run `rtk go test ./...` for cross-package changes, upstream fork merges, and runtime config changes.
-- Run `rtk actionlint .github/workflows/build.yml` for GitHub Actions edits.
+- Run `rtk actionlint <changed-workflow.yml>` for GitHub Actions edits.
 - Run `rtk proxy git diff --check` before committing.
 
 ## Source Examples
