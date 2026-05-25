@@ -194,7 +194,11 @@ jobs:
       run: |
         VERSION="${GITHUB_REF_NAME,,}-smart-$(git rev-parse --short HEAD)"
         VERSION="${VERSION//\//-}"
-        PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
+        LatestTag="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)"
+        if [ -z "${LatestTag}" ]; then
+          LatestTag="v0.0.0"
+        fi
+        PackageVersion="$(echo "${LatestTag}" | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
         if [ -n "${{ github.event.inputs.version }}" ]; then
           VERSION=${{ github.event.inputs.version }}
           PackageVersion="${VERSION#v}"

@@ -29,4 +29,5 @@ echo "## Maintenance" >> release.md
 git log --pretty=format:"* %h %s by @%an" --grep="^chore\|^docs\|^refactor" -i $version_range | sort -f | uniq >> release.md
 echo "" >> release.md
 
-echo "**Full Changelog**: https://github.com/MetaCubeX/mihomo/compare/$version_range" >> release.md
+repo="${GITHUB_REPOSITORY:-icy37785/mihomo}"
+echo "**Full Changelog**: https://github.com/${repo}/compare/$version_range" >> release.md
