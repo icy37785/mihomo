@@ -50,7 +50,7 @@ const (
 	maxSelected              = 10
 
 	parallelDials            = 5
-	connectThreshold         = 2.0
+	connectThreshold         = 5.0
 )
 
 var (
@@ -232,7 +232,9 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		var batch []C.Proxy
 		var historyConnectTime int64
 		var timeout time.Duration
-		if i == 0 {
+		if len(proxies) == 1 {
+			batch = proxies[0:1]
+		} else if i == 0 {
 			batch = proxies[0:1]
 		} else {
 			begin := 1 + (i-1) * parallelDials
@@ -301,33 +303,54 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	var finalErr error
-	
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
-	
-	for i := 0; i < len(proxies) && i < 3; i++ {
-		proxy := proxies[i]
-		historyConnectTime := s.getHistoryConnectStats(metadata, proxy)
-		var timeout time.Duration
-		if historyConnectTime > 0 {
-			timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
-		}
-		if timeout > C.DefaultUDPTimeout || timeout <= 0 {
-			timeout = C.DefaultUDPTimeout
-		}
-		ctxDial, cancel := context.WithTimeout(ctx, timeout)
-		start := time.Now()
-		pc, err = proxy.ListenPacketContext(ctxDial, metadata)
-		cancel()
-		connectTime := time.Since(start).Milliseconds()
 
-		if err == nil {
-			pc.AppendToChains(s)
-			pc = s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime)
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.NetWork == C.UDP, []C.Proxy{proxy})
-			return pc, nil
+	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	limit := len(proxies)
+	if limit > maxSelected {
+		limit = maxSelected
+	}
+
+	singleProxyRetry := (len(proxies) == 1)
+
+	for i := 0; i < limit; i++ {
+		proxy := proxies[i]
+		attempts := 1
+		if singleProxyRetry {
+			attempts = maxRetries
 		}
-		finalErr = err
-		go s.recordConnectionStats("failed", metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, err)
+
+		for a := 0; a < attempts; a++ {
+			historyConnectTime := s.getHistoryConnectStats(metadata, proxy)
+			var timeout time.Duration
+			if historyConnectTime > 0 {
+				timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
+			}
+			if timeout > C.DefaultUDPTimeout || timeout <= 0 {
+				timeout = C.DefaultUDPTimeout
+			}
+			ctxDial, cancel := context.WithTimeout(ctx, timeout)
+			start := time.Now()
+			pc, err = proxy.ListenPacketContext(ctxDial, metadata)
+			cancel()
+			connectTime := time.Since(start).Milliseconds()
+
+			if err != nil {
+				if tunnel.ShouldStopRetry(err) {
+					return nil, err
+				}
+				finalErr = err
+				go s.recordConnectionStats("failed", metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, err)
+				continue
+			}
+
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.NetWork == C.UDP, []C.Proxy{proxy})
+			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
+		}
+
+		if singleProxyRetry {
+			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.NetWork == C.UDP)
+			break
+		}
 	}
 
 	return nil, finalErr
@@ -389,6 +412,18 @@ func (s *Smart) WrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metadata
 		c, proxy, metadata, connectTime,
 		&firstReadLatency, &firstReadErr, &firstWriteErr,
 	)
+}
+
+func (s *Smart) WrapPacketConnWithMetric(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.PacketConn {
+	pc.AppendToChains(s)
+	
+	var udpLatency atomic.Int64
+
+	pc = callback.NewFirstReadCallBackPacketConn(pc, func(latency int64) {
+		udpLatency.Store(latency)
+	})
+
+	return s.registerPacketClosureMetricsCallback(pc, proxy, metadata, connectTime, &udpLatency)
 }
 
 func (s *Smart) Set(name string) error {
@@ -1208,7 +1243,7 @@ func formatTimeUnit(val float64) string {
 
 // 日志记录
 func (s *Smart) logConnectionStats(status string, record *smart.StatsRecord, metadata *C.Metadata, baseWeight, priorityFactor float64,
-	addressDisplay, proxyName string, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
+	addressDisplay, proxyName string, connectTime int64, latency int64, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
 	connectionDuration int64, asnInfo string, ModelPredicted bool) {
 
 	var tcpAsnWeight, udpAsnWeight float64
@@ -1233,10 +1268,12 @@ func (s *Smart) logConnectionStats(status string, record *smart.StatsRecord, met
 
 	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], TCP ASN: [%.4f], UDP ASN: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
 		"For (Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s]) "+
-		"- Current: (Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
-		"- History: (Success: [%d], Failure: [%d], Connect: [%s], Latency: [%s], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
+		"- Current: (Connect: [%s], Latency: [%s], Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
+		"- History: (Success: [%d], Failure: [%d], Avg Connect: [%s], Avg Latency: [%s], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
 		status, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], tcpAsnWeight, udpAsnWeight, baseWeight, priorityFactor,
 		s.Name(), proxyName, metadata.NetWork.String(), addressDisplay,
+		formatTimeUnit(float64(connectTime)),
+		formatTimeUnit(float64(latency)),
 		formatTrafficUnit(uploadTotal*1024*1024, false),
 		formatTrafficUnit(downloadTotal*1024*1024, false),
 		formatTrafficUnit(maxUploadRate*1024, true),
@@ -1288,7 +1325,7 @@ func updateAverageValueFloat(oldValue, newValue float64) float64 {
 }
 
 func (s *Smart) recordConnectionStats(status string, metadata *C.Metadata, proxy C.Proxy,
-	connectTime int64, latency int64, uploadTotal int64, downloadTotal int64, maxUploadRate int64, maxDownloadRate int64,
+	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
 	connectionDuration int64, err error) {
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
@@ -1429,7 +1466,7 @@ func (s *Smart) recordConnectionStats(status string, metadata *C.Metadata, proxy
 	}
 
 	s.logConnectionStats(status, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
-		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted)
+		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted)
 }
 
 func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error]) C.Conn {
@@ -1463,7 +1500,7 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 	})
 }
 
-func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.PacketConn {
+func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, udpLatency *atomic.Int64) C.PacketConn {
 	return callback.NewCloseCallbackPacketConn(pc, func() {
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
 		if tracker != nil {
@@ -1474,7 +1511,7 @@ func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Pr
 			maxUploadRate := info.MaxUploadRate.Load()
 			maxDownloadRate := info.MaxDownloadRate.Load()
 
-			go s.recordConnectionStats("closed", metadata, proxy, connectTime, 0,
+			go s.recordConnectionStats("closed", metadata, proxy, connectTime, udpLatency.Load(),
 				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil)
 			return
 		}
