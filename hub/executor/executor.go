@@ -26,8 +26,6 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/sniffer"
-	"github.com/metacubex/mihomo/component/smart/lightgbm"
-	tlsC "github.com/metacubex/mihomo/component/tls"
 	"github.com/metacubex/mihomo/component/trie"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -42,6 +40,7 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp/ntp"
 	"github.com/metacubex/mihomo/tunnel"
+	"github.com/metacubex/mihomo/component/smart/lightgbm"
 )
 
 var mux sync.Mutex
@@ -168,23 +167,22 @@ func GetGeneral() *config.General {
 			ASN:     geodata.ASNUrl(),
 			GeoSite: geodata.GeoSiteUrl(),
 		},
-		GeoAutoUpdate:           updater.GeoAutoUpdate(),
-		GeoUpdateInterval:       updater.GeoUpdateInterval(),
-		GeodataMode:             geodata.GeodataMode(),
-		GeodataLoader:           geodata.LoaderName(),
-		GeositeMatcher:          geodata.SiteMatcherName(),
-		TCPConcurrent:           dialer.GetTcpConcurrent(),
-		FindProcessMode:         tunnel.FindProcessMode(),
-		Sniffing:                tunnel.IsSniffing(),
-		GlobalClientFingerprint: tlsC.GetGlobalFingerprint(),
-		GlobalUA:                mihomoHttp.UA(),
-		ETagSupport:             resource.ETag(),
-		KeepAliveInterval:       int(keepalive.KeepAliveInterval() / time.Second),
-		KeepAliveIdle:           int(keepalive.KeepAliveIdle() / time.Second),
-		DisableKeepAlive:        keepalive.DisableKeepAlive(),
-		LgbmAutoUpdate:          updater.LgbmAutoUpdate(),
-		LgbmUpdateInterval:      updater.LgbmUpdateInterval(),
-		LgbmUrl:                 lightgbm.LgbmUrl(),
+		GeoAutoUpdate:      updater.GeoAutoUpdate(),
+		GeoUpdateInterval:  updater.GeoUpdateInterval(),
+		GeodataMode:        geodata.GeodataMode(),
+		GeodataLoader:      geodata.LoaderName(),
+		GeositeMatcher:     geodata.SiteMatcherName(),
+		TCPConcurrent:      dialer.GetTcpConcurrent(),
+		FindProcessMode:    tunnel.FindProcessMode(),
+		Sniffing:           tunnel.IsSniffing(),
+		GlobalUA:           mihomoHttp.UA(),
+		ETagSupport:        resource.ETag(),
+		KeepAliveInterval:  int(keepalive.KeepAliveInterval() / time.Second),
+		KeepAliveIdle:      int(keepalive.KeepAliveIdle() / time.Second),
+		DisableKeepAlive:   keepalive.DisableKeepAlive(),
+		LgbmAutoUpdate:     updater.LgbmAutoUpdate(),
+		LgbmUpdateInterval: updater.LgbmUpdateInterval(),
+		LgbmUrl:            lightgbm.LgbmUrl(),
 	}
 
 	return general
@@ -435,11 +433,6 @@ func updateGeneral(general *config.General, logging bool) {
 	lightgbm.InitCollector(general.SmartCollectorSize)
 	mihomoHttp.SetUA(general.GlobalUA)
 	resource.SetETag(general.ETagSupport)
-
-	if general.GlobalClientFingerprint != "" {
-		log.Warnln("The `global-client-fingerprint` configuration is deprecated, please set `client-fingerprint` directly on the proxy instead")
-	}
-	tlsC.SetGlobalFingerprint(general.GlobalClientFingerprint)
 }
 
 func updateUsers(users []auth.AuthUser) {
