@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/common/orderedmap"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/yaml"
+	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
@@ -35,6 +36,7 @@ import (
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
 	R "github.com/metacubex/mihomo/rules"
+	RB "github.com/metacubex/mihomo/rules/bundle"
 	RC "github.com/metacubex/mihomo/rules/common"
 	RP "github.com/metacubex/mihomo/rules/provider"
 	RW "github.com/metacubex/mihomo/rules/wrapper"
@@ -608,6 +610,12 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 	// config with default value
 	rawCfg := DefaultRawConfig()
 
+	// decrypt config
+	buf, err := age.DecryptBytes(buf)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt config error: %w", err)
+	}
+
 	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
 	}
@@ -892,6 +900,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	proxies["REJECT-DROP"] = adapter.NewProxy(outbound.NewRejectDrop())
 	proxies["COMPATIBLE"] = adapter.NewProxy(outbound.NewCompatible())
 	proxies["PASS"] = adapter.NewProxy(outbound.NewPass())
+	proxies["PASS-RULE"] = adapter.NewProxy(outbound.NewPassRule())
 	proxyList = append(proxyList, "DIRECT", "REJECT")
 
 	// parse proxy
@@ -962,7 +971,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	var ps []C.Proxy
 	for _, v := range proxyList {
-		if proxies[v].Type() == C.Pass {
+		if proxies[v].Type() == C.Pass || proxies[v].Type() == C.PassRule {
 			continue
 		}
 		ps = append(ps, proxies[v])
@@ -976,6 +985,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			&outboundgroup.GroupCommonOption{
 				Name: "GLOBAL",
 			},
+			proxies["COMPATIBLE"],
 			[]P.ProxyProvider{pd},
 		)
 		proxies["GLOBAL"] = adapter.NewProxy(global)
@@ -1013,7 +1023,7 @@ func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider
 	ruleProviders = map[string]P.RuleProvider{}
 	// parse rule provider
 	for name, mapping := range cfg.RuleProvider {
-		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule)
+		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule, RB.MakeBundleFile)
 		if err != nil {
 			return nil, err
 		}

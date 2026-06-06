@@ -110,7 +110,7 @@ func getConfigFilename() string {
 	return filename
 }
 
-func NewSmart(option *GroupCommonOption, providers []provider.ProxyProvider, options ...smartOption) (*Smart, error) {
+func NewSmart(option *GroupCommonOption, emptyFallback C.Proxy, providers []provider.ProxyProvider, options ...smartOption) (*Smart, error) {
 	if option.URL == "" {
 		option.URL = C.DefaultTestURL
 	}
@@ -128,6 +128,7 @@ func NewSmart(option *GroupCommonOption, providers []provider.ProxyProvider, opt
 			ExcludeType:     option.ExcludeType,
 			TestTimeout:     option.TestTimeout,
 			MaxFailedTimes:  option.MaxFailedTimes,
+			EmptyFallback:   emptyFallback,
 			Providers:       providers,
 		}),
 		testUrl:              option.URL,
@@ -485,12 +486,21 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"fixed":           s.selected,
 		"hidden":          s.Hidden(),
 		"icon":            s.Icon(),
+		"emptyFallback":   s.EmptyFallback().Name(),
 		"policy-priority": policyPriorityBuf.String(),
 		"useLightGBM":     s.useLightGBM,
 		"collectData":     s.collectData,
 		"sampleRate":      s.sampleRate,
 		"preferASN":       s.preferASN,
 	})
+}
+
+func (s *Smart) Providers() []provider.ProxyProvider {
+	return s.providers
+}
+
+func (s *Smart) Proxies() []C.Proxy {
+	return s.GetProxies(false)
 }
 
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
