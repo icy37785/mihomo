@@ -95,6 +95,9 @@ func (s *Snell) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 				_ = c.Close()
 				continue
 			}
+			if pc, ok := c.(*snell.PoolConn); ok {
+				pc.MarkReusable()
+			}
 			return NewConn(c, s), nil
 		}
 		// Both pool attempts yielded stale conns. Fall through to a fresh

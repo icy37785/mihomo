@@ -19,6 +19,10 @@ func TestPoolConnCloseDrainsAndReturnsToPool(t *testing.T) {
 	})
 	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
 
+	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	conn.MarkReusable()
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -26,8 +30,8 @@ func TestPoolConnCloseDrainsAndReturnsToPool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if rawConn.writes != 1 {
-		t.Fatalf("close should send one half-close record, got %d", rawConn.writes)
+	if rawConn.writes != 2 {
+		t.Fatalf("close should send the request and one half-close record, got %d writes", rawConn.writes)
 	}
 	if !rawConn.readDeadlineCleared {
 		t.Fatal("close should clear read deadline before returning to pool")
@@ -48,8 +52,105 @@ func TestPoolConnCloseDrainsAndReturnsToPool(t *testing.T) {
 	}
 }
 
+func TestPoolConnCloseBeforeRequestClosesRawConnection(t *testing.T) {
+	rawConn := &recordingConn{}
+	pooledConn := &Snell{Conn: rawConn}
+	factoryConn := &Snell{Conn: &recordingConn{}}
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return factoryConn, nil
+	})
+	conn := &PoolConn{Snell: pooledConn, pool: pool}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rawConn.writes != 0 {
+		t.Fatalf("close before request should not send half-close record, got %d writes", rawConn.writes)
+	}
+	if !rawConn.closed {
+		t.Fatal("close before request should close the raw connection")
+	}
+
+	got, err := pool.pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.conn != factoryConn {
+		t.Fatal("unstarted connection should not be returned to the pool")
+	}
+}
+
+func TestPoolConnCloseAfterRequestBeforeReusableClosesRawConnection(t *testing.T) {
+	rawConn := &recordingConn{}
+	pooledConn := &Snell{Conn: rawConn}
+	factoryConn := &Snell{Conn: &recordingConn{}}
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return factoryConn, nil
+	})
+	conn := &PoolConn{Snell: pooledConn, pool: pool}
+
+	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rawConn.writes != 1 {
+		t.Fatalf("close before reusable should only send the request, got %d writes", rawConn.writes)
+	}
+	if !rawConn.closed {
+		t.Fatal("close before reusable should close the raw connection")
+	}
+
+	got, err := pool.pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.conn != factoryConn {
+		t.Fatal("connection closed before reusable should not be returned to the pool")
+	}
+}
+
+func TestPoolConnCloseWriteBeforeRequestClosesRawConnection(t *testing.T) {
+	rawConn := &recordingConn{}
+	pooledConn := &Snell{Conn: rawConn}
+	factoryConn := &Snell{Conn: &recordingConn{}}
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return factoryConn, nil
+	})
+	conn := &PoolConn{Snell: pooledConn, pool: pool}
+
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if rawConn.writes != 0 {
+		t.Fatalf("CloseWrite before request should not send half-close record, got %d writes", rawConn.writes)
+	}
+	if !rawConn.closed {
+		t.Fatal("CloseWrite before request should close the raw connection")
+	}
+
+	// MarkReusable must not revive a connection that already took the raw-close path.
+	conn.MarkReusable()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := pool.pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.conn != factoryConn {
+		t.Fatal("unstarted connection should not be returned to the pool")
+	}
+}
+
 func TestPoolConnCloseDiscardsWhenDrainFails(t *testing.T) {
-	rawConn := &recordingConn{} // Read returns io.EOF, not ErrZeroChunk
+	rawConn := &recordingConn{}
 	pooledConn := &Snell{Conn: rawConn, reply: true}
 	factoryConn := &Snell{Conn: &recordingConn{}}
 	pool := NewPool(func(context.Context) (*Snell, error) {
@@ -57,6 +158,10 @@ func TestPoolConnCloseDiscardsWhenDrainFails(t *testing.T) {
 	})
 	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
 
+	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	conn.MarkReusable()
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -83,6 +188,10 @@ func TestPoolConnCloseDiscardsAtMaxUsesPerConn(t *testing.T) {
 	// uses == defaultMaxUsesPerConn — this Close must not return to the pool.
 	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: defaultMaxUsesPerConn}
 
+	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	conn.MarkReusable()
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +224,10 @@ func TestPoolGetContextIncrementsUses(t *testing.T) {
 	if pcFirst.uses != 1 {
 		t.Fatalf("first checkout uses: got %d, want 1", pcFirst.uses)
 	}
+	if _, err := pcFirst.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	pcFirst.MarkReusable()
 	if err := pcFirst.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +257,10 @@ func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	})
 	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
 
+	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
+		t.Fatal(err)
+	}
+	conn.MarkReusable()
 	if err := conn.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -155,8 +272,8 @@ func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	if got.conn != factoryConn {
 		t.Fatal("CloseWrite should not put the active connection back into the pool")
 	}
-	if rawConn.writes != 1 {
-		t.Fatalf("CloseWrite should send one half-close record, got %d", rawConn.writes)
+	if rawConn.writes != 2 {
+		t.Fatalf("CloseWrite should send the request and one half-close record, got %d writes", rawConn.writes)
 	}
 	if !pooledConn.reply {
 		t.Fatal("CloseWrite should not reset reply while the read side may still be active")
@@ -172,8 +289,8 @@ func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	if got.conn != pooledConn {
 		t.Fatal("Close should return the connection to the pool after CloseWrite")
 	}
-	if rawConn.writes != 1 {
-		t.Fatalf("Close after CloseWrite should not send another half-close record, got %d", rawConn.writes)
+	if rawConn.writes != 2 {
+		t.Fatalf("Close after CloseWrite should not send another half-close record, got %d writes", rawConn.writes)
 	}
 	if pooledConn.reply {
 		t.Fatal("Close should reset reply before returning the connection to the pool")
