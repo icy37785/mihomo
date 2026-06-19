@@ -986,13 +986,17 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	providersMap[provider.ReservedName] = pd
 
 	if !hasGlobal {
-		global := outboundgroup.NewSelector(
-			&outboundgroup.GroupCommonOption{
+		global, err := outboundgroup.NewSelector(
+			outboundgroup.GroupCommonOption{
 				Name: "GLOBAL",
 			},
+			outboundgroup.SelectorOption{},
 			proxies["COMPATIBLE"],
 			[]P.ProxyProvider{pd},
 		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("new GLOBAL proxy group error: %w", err)
+		}
 		proxies["GLOBAL"] = adapter.NewProxy(global)
 	}
 

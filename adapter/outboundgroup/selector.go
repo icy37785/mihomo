@@ -9,6 +9,8 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
+type SelectorOption struct{}
+
 type Selector struct {
 	*GroupBase
 	disableUDP bool
@@ -115,7 +117,7 @@ func (s *Selector) Proxies() []C.Proxy {
 	return s.GetProxies(false)
 }
 
-func NewSelector(option *GroupCommonOption, emptyFallback C.Proxy, providers []P.ProxyProvider) *Selector {
+func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Selector, error) {
 	return &Selector{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -133,5 +135,5 @@ func NewSelector(option *GroupCommonOption, emptyFallback C.Proxy, providers []P
 		selected:   emptyFallback.Name(),
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,
-	}
+	}, nil
 }
