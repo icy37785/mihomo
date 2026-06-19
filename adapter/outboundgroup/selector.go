@@ -9,7 +9,9 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
-type SelectorOption struct{}
+type SelectorOption struct {
+	DefaultSelected string `group:"default-selected,omitempty"`
+}
 
 type Selector struct {
 	*GroupBase
@@ -132,7 +134,7 @@ func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyF
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
 		}),
-		selected:   emptyFallback.Name(),
+		selected:   selectorOption.DefaultSelected,
 		disableUDP: option.DisableUDP,
 		testUrl:    option.URL,
 	}, nil

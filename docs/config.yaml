@@ -1462,6 +1462,7 @@ proxy-groups:
       - ss2
       - vmess1
       - auto
+    # default-selected: ss1 # 默认选择的节点（该项为空或者设置的节点名不存在时，默认选择组中第一个节点）
 
   - name: UseProvider
     type: select
