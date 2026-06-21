@@ -160,6 +160,7 @@ type DNS struct {
 	Fallback              []dns.NameServer
 	FallbackIPFilter      []C.IpMatcher
 	FallbackDomainFilter  []C.DomainMatcher
+	FallbackLazyQuery     bool
 	Listen                string
 	ListenRoutingMark     int
 	EnhancedMode          C.DNSMode
@@ -234,6 +235,7 @@ type RawDNS struct {
 	NameServer                   []string                            `yaml:"nameserver" json:"nameserver"`
 	Fallback                     []string                            `yaml:"fallback" json:"fallback"`
 	FallbackFilter               RawFallbackFilter                   `yaml:"fallback-filter" json:"fallback-filter"`
+	FallbackLazyQuery            bool                                `yaml:"fallback-lazy-query" json:"fallback-lazy-query"`
 	Listen                       string                              `yaml:"listen" json:"listen"`
 	ListenRoutingMark            int                                 `yaml:"listen-routing-mark" json:"listen-routing-mark"`
 	EnhancedMode                 C.DNSMode                           `yaml:"enhanced-mode" json:"enhanced-mode"`
@@ -1613,6 +1615,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 				dnsCfg.FallbackDomainFilter = append(dnsCfg.FallbackDomainFilter, matcher)
 			}
 		}
+		dnsCfg.FallbackLazyQuery = cfg.FallbackLazyQuery
 	}
 
 	return dnsCfg, nil
