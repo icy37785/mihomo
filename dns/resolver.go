@@ -310,12 +310,13 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 
 	msgCh := r.asyncExchange(ctx, r.main, m)
 
-	if r.fallback == nil || len(r.fallback) == 0 { // directly return if no fallback servers are available
+	if r.fallback == nil { // directly return if no fallback servers are available
 		res := <-msgCh
 		msg, err = res.Msg, res.Error
 		return
 	}
 
+	fallbackMsg := r.asyncExchange(ctx, r.fallback, m)
 	res := <-msgCh
 	if res.Error == nil {
 		if ips := msgToIP(res.Msg); len(ips) != 0 {
@@ -329,7 +330,7 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		}
 	}
 
-	res = <-r.asyncExchange(ctx, r.fallback, m)
+	res = <-fallbackMsg
 	msg, err = res.Msg, res.Error
 	return
 }
