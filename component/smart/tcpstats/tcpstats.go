@@ -22,6 +22,26 @@ func (s *Stats) LossRate() float64 {
 	return 0
 }
 
+func (s *Stats) TotalSent() uint64 {
+	if s == nil {
+		return 0
+	}
+	if s.SegsOut > 0 {
+		return s.SegsOut
+	}
+	return s.BytesSent
+}
+
+func (s *Stats) TotalRetrans() uint64 {
+	if s == nil {
+		return 0
+	}
+	if s.RetransSegs > 0 || s.SegsOut > 0 {
+		return s.RetransSegs
+	}
+	return s.BytesRetrans
+}
+
 func GetTCPStats(conn net.Conn) *Stats {
 	if conn == nil {
 		return nil

@@ -11,13 +11,13 @@ import (
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 )
 
-func TestPoolConnCloseDrainsAndReturnsToPool(t *testing.T) {
-	rawConn := &drainConn{}
-	pooledConn := &Snell{Conn: rawConn, reply: true}
+func TestPoolConnCloseIsIdempotent(t *testing.T) {
+	rawConn := &recordingConn{}
+	pooledConn := &Snell{Conn: rawConn}
 	pool := NewPool(func(context.Context) (*Snell, error) {
 		return nil, errors.New("factory should not be called")
 	})
-	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
+	conn := &PoolConn{Snell: pooledConn, pool: pool}
 
 	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
 		t.Fatal(err)
@@ -33,22 +33,13 @@ func TestPoolConnCloseDrainsAndReturnsToPool(t *testing.T) {
 	if rawConn.writes != 2 {
 		t.Fatalf("close should send the request and one half-close record, got %d writes", rawConn.writes)
 	}
-	if !rawConn.readDeadlineCleared {
-		t.Fatal("close should clear read deadline before returning to pool")
-	}
-	if rawConn.closed {
-		t.Fatal("close should not close the underlying conn when drain succeeds")
-	}
 
 	got, err := pool.pool.Get()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != pooledConn {
+	if got != pooledConn {
 		t.Fatal("pooled connection mismatch")
-	}
-	if got.uses != 1 {
-		t.Fatalf("uses count not preserved: got %d, want 1", got.uses)
 	}
 }
 
@@ -79,7 +70,7 @@ func TestPoolConnCloseBeforeRequestClosesRawConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != factoryConn {
+	if got != factoryConn {
 		t.Fatal("unstarted connection should not be returned to the pool")
 	}
 }
@@ -111,7 +102,7 @@ func TestPoolConnCloseAfterRequestBeforeReusableClosesRawConnection(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != factoryConn {
+	if got != factoryConn {
 		t.Fatal("connection closed before reusable should not be returned to the pool")
 	}
 }
@@ -144,118 +135,19 @@ func TestPoolConnCloseWriteBeforeRequestClosesRawConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != factoryConn {
+	if got != factoryConn {
 		t.Fatal("unstarted connection should not be returned to the pool")
 	}
 }
 
-func TestPoolConnCloseDiscardsWhenDrainFails(t *testing.T) {
+func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	rawConn := &recordingConn{}
 	pooledConn := &Snell{Conn: rawConn, reply: true}
 	factoryConn := &Snell{Conn: &recordingConn{}}
 	pool := NewPool(func(context.Context) (*Snell, error) {
 		return factoryConn, nil
 	})
-	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
-
-	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
-		t.Fatal(err)
-	}
-	conn.MarkReusable()
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !rawConn.closed {
-		t.Fatal("close should close the underlying conn when drain fails")
-	}
-
-	got, err := pool.pool.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.conn != factoryConn {
-		t.Fatal("drained-failed conn should not be returned to the pool")
-	}
-}
-
-func TestPoolConnCloseDiscardsAtMaxUsesPerConn(t *testing.T) {
-	rawConn := &drainConn{}
-	pooledConn := &Snell{Conn: rawConn, reply: true}
-	factoryConn := &Snell{Conn: &recordingConn{}}
-	pool := NewPool(func(context.Context) (*Snell, error) {
-		return factoryConn, nil
-	})
-	// uses == defaultMaxUsesPerConn — this Close must not return to the pool.
-	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: defaultMaxUsesPerConn}
-
-	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
-		t.Fatal(err)
-	}
-	conn.MarkReusable()
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !rawConn.closed {
-		t.Fatal("close should close the underlying conn at the per-conn use cap")
-	}
-
-	got, err := pool.pool.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.conn != factoryConn {
-		t.Fatal("capped conn should not be returned to the pool")
-	}
-}
-
-func TestPoolGetContextIncrementsUses(t *testing.T) {
-	factoryCalls := 0
-	factoryConn := &Snell{Conn: &drainConn{}, reply: true}
-	pool := NewPool(func(context.Context) (*Snell, error) {
-		factoryCalls++
-		return factoryConn, nil
-	})
-
-	first, err := pool.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pcFirst := first.(*PoolConn)
-	if pcFirst.uses != 1 {
-		t.Fatalf("first checkout uses: got %d, want 1", pcFirst.uses)
-	}
-	if _, err := pcFirst.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
-		t.Fatal(err)
-	}
-	pcFirst.MarkReusable()
-	if err := pcFirst.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	second, err := pool.Get()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pcSecond := second.(*PoolConn)
-	if pcSecond.uses != 2 {
-		t.Fatalf("second checkout uses: got %d, want 2", pcSecond.uses)
-	}
-	if pcSecond.Snell != factoryConn {
-		t.Fatal("second checkout should reuse the same TCP conn")
-	}
-	if factoryCalls != 1 {
-		t.Fatalf("factory should be called once across both checkouts, got %d", factoryCalls)
-	}
-}
-
-func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
-	rawConn := &drainConn{}
-	pooledConn := &Snell{Conn: rawConn, reply: true}
-	factoryConn := &Snell{Conn: &recordingConn{}}
-	pool := NewPool(func(context.Context) (*Snell, error) {
-		return factoryConn, nil
-	})
-	conn := &PoolConn{Snell: pooledConn, pool: pool, uses: 1}
+	conn := &PoolConn{Snell: pooledConn, pool: pool}
 
 	if _, err := conn.Write([]byte{Version, CommandConnectV2, 0}); err != nil {
 		t.Fatal(err)
@@ -269,7 +161,7 @@ func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != factoryConn {
+	if got != factoryConn {
 		t.Fatal("CloseWrite should not put the active connection back into the pool")
 	}
 	if rawConn.writes != 2 {
@@ -286,7 +178,7 @@ func TestPoolConnCloseWriteDoesNotReturnConnectionToPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.conn != pooledConn {
+	if got != pooledConn {
 		t.Fatal("Close should return the connection to the pool after CloseWrite")
 	}
 	if rawConn.writes != 2 {
@@ -356,52 +248,6 @@ func (a recordingAddr) Network() string {
 
 func (a recordingAddr) String() string {
 	return string(a)
-}
-
-// drainConn lets Close drain to completion: Read immediately surfaces the
-// server's zero-chunk half-close, and SetReadDeadline records whether the
-// caller cleared the drain deadline on the way out.
-type drainConn struct {
-	writes              int
-	closed              bool
-	readDeadlineCleared bool
-}
-
-func (c *drainConn) Read([]byte) (int, error) {
-	return 0, shadowaead.ErrZeroChunk
-}
-
-func (c *drainConn) Write(b []byte) (int, error) {
-	c.writes++
-	return len(b), nil
-}
-
-func (c *drainConn) Close() error {
-	c.closed = true
-	return nil
-}
-
-func (*drainConn) LocalAddr() net.Addr {
-	return recordingAddr("local")
-}
-
-func (*drainConn) RemoteAddr() net.Addr {
-	return recordingAddr("remote")
-}
-
-func (*drainConn) SetDeadline(time.Time) error {
-	return nil
-}
-
-func (c *drainConn) SetReadDeadline(t time.Time) error {
-	if t.IsZero() {
-		c.readDeadlineCleared = true
-	}
-	return nil
-}
-
-func (*drainConn) SetWriteDeadline(time.Time) error {
-	return nil
 }
 
 type zeroChunkConn struct{}

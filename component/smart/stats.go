@@ -35,6 +35,8 @@ type StatsRecord struct {
 	MaxDownloadRate    float64                 `json:"max_download_rate"`
 	ConnectionDuration float64                 `json:"connection_duration"`
 	LossRate           float64                 `json:"loss_rate,omitempty"`
+	CumulSent          uint64                  `json:"cumul_sent,omitempty"`
+	CumulRetrans       uint64                  `json:"cumul_retrans,omitempty"`
 }
 
 type NodeState struct {
@@ -57,6 +59,8 @@ type AtomicStatsRecord struct {
 	maxUploadRate   atomic.Float64
 	maxDownloadRate atomic.Float64
 	lossRate        atomic.Float64
+	cumulSent       atomic.Int64
+	cumulRetrans    atomic.Int64
 
 	weights         *lru.LruCache[string, float64]
 }
@@ -152,6 +156,8 @@ func (s *Store) GetOrCreateAtomicRecord(cacheKey string, group, config, target, 
 				record.maxUploadRate.Store(existingRecord.MaxUploadRate)
 				record.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
 				record.lossRate.Store(existingRecord.LossRate)
+				record.cumulSent.Store(int64(existingRecord.CumulSent))
+				record.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
 				if existingRecord.Weights != nil {
 					for k, v := range existingRecord.Weights {
 						record.weights.Set(k, v)
@@ -183,6 +189,8 @@ func (record *AtomicStatsRecord) CreateStatsSnapshot(cacheKey string) *StatsReco
 		MaxDownloadRate:    record.maxDownloadRate.Load(),
 		ConnectionDuration: record.duration.Load(),
 		LossRate:           record.lossRate.Load(),
+		CumulSent:          uint64(record.cumulSent.Load()),
+		CumulRetrans:       uint64(record.cumulRetrans.Load()),
 		Weights:            record.weights.FilterByKeyPrefix(""),
 	}
 
@@ -215,6 +223,10 @@ func (r *AtomicStatsRecord) Get(field string) interface{} {
 		return r.duration.Load()
 	case "lossRate":
 		return r.lossRate.Load()
+	case "cumulSent":
+		return r.cumulSent.Load()
+	case "cumulRetrans":
+		return r.cumulRetrans.Load()
 	default:
 		return nil
 	}
@@ -266,6 +278,14 @@ func (r *AtomicStatsRecord) Set(field string, value interface{}) {
 		if v, ok := value.(float64); ok {
 			r.lossRate.Store(v)
 		}
+	case "cumulSent":
+		if v, ok := value.(int64); ok {
+			r.cumulSent.Store(v)
+		}
+	case "cumulRetrans":
+		if v, ok := value.(int64); ok {
+			r.cumulRetrans.Store(v)
+		}
 	}
 }
 
@@ -309,6 +329,26 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 				r.downloadTotal.Store(maxDownload / 2)
 			} else {
 				r.downloadTotal.Add(v)
+			}
+		}
+	case "cumulSent":
+		if v, ok := value.(int64); ok && v > 0 {
+			current := r.cumulSent.Load()
+			if current > math.MaxInt64/2-v {
+				r.cumulSent.Store(current / 2)
+				r.cumulRetrans.Store(r.cumulRetrans.Load() / 2)
+			} else {
+				r.cumulSent.Add(v)
+			}
+		}
+	case "cumulRetrans":
+		if v, ok := value.(int64); ok && v > 0 {
+			current := r.cumulRetrans.Load()
+			if current > math.MaxInt64/2-v {
+				r.cumulSent.Store(r.cumulSent.Load() / 2)
+				r.cumulRetrans.Store(current / 2)
+			} else {
+				r.cumulRetrans.Add(v)
 			}
 		}
 	}

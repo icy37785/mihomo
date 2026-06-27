@@ -82,27 +82,19 @@ func (s *Snell) writeHeaderContext(ctx context.Context, c net.Conn, metadata *C.
 // DialContext implements C.ProxyAdapter
 func (s *Snell) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	if s.reuse {
-		// A pooled conn may be stale (server-side half-closed it after the
-		// previous session but before our maxAge fires). Detect by retrying
-		// the CONNECT write once — the second pool.Get either yields another
-		// idle conn or falls through to the factory and dials fresh.
-		for attempts := 0; attempts < 2; attempts++ {
-			c, gerr := s.pool.GetContext(ctx)
-			if gerr != nil {
-				return nil, gerr
-			}
-			if err = s.writeHeaderContext(ctx, c, metadata); err != nil {
-				_ = c.Close()
-				continue
-			}
-			if pc, ok := c.(*snell.PoolConn); ok {
-				pc.MarkReusable()
-			}
-			return NewConn(c, s), nil
+		c, err := s.pool.Get()
+		if err != nil {
+			return nil, err
 		}
-		// Both pool attempts yielded stale conns. Fall through to a fresh
-		// dial below; it bypasses the pool but still writes a reuse-capable
-		// header so the next call can pool the conn after one session.
+
+		if err = s.writeHeaderContext(ctx, c, metadata); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if pc, ok := c.(*snell.PoolConn); ok {
+			pc.MarkReusable()
+		}
+		return NewConn(c, s), err
 	}
 
 	c, err := s.dialer.DialContext(ctx, "tcp", s.addr)

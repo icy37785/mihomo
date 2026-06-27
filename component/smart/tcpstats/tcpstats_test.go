@@ -134,3 +134,53 @@ func TestLossRate_BytesBased(t *testing.T) {
 		t.Errorf("expected %.4f for bytes-based, got %.4f", expected, rate)
 	}
 }
+
+func TestTotalSent_SegsPreferred(t *testing.T) {
+	s := &Stats{SegsOut: 100, BytesSent: 50000}
+	if got := s.TotalSent(); got != 100 {
+		t.Errorf("expected SegsOut (100), got %d", got)
+	}
+}
+
+func TestTotalSent_BytesFallback(t *testing.T) {
+	s := &Stats{SegsOut: 0, BytesSent: 50000}
+	if got := s.TotalSent(); got != 50000 {
+		t.Errorf("expected BytesSent (50000), got %d", got)
+	}
+}
+
+func TestTotalSent_Nil(t *testing.T) {
+	var s *Stats
+	if got := s.TotalSent(); got != 0 {
+		t.Errorf("expected 0 for nil, got %d", got)
+	}
+}
+
+func TestTotalRetrans_SegsPreferred(t *testing.T) {
+	s := &Stats{SegsOut: 100, RetransSegs: 5, BytesSent: 50000, BytesRetrans: 1000}
+	if got := s.TotalRetrans(); got != 5 {
+		t.Errorf("expected RetransSegs (5), got %d", got)
+	}
+}
+
+func TestTotalRetrans_BytesFallback(t *testing.T) {
+	s := &Stats{SegsOut: 0, RetransSegs: 0, BytesSent: 50000, BytesRetrans: 1000}
+	if got := s.TotalRetrans(); got != 1000 {
+		t.Errorf("expected BytesRetrans (1000), got %d", got)
+	}
+}
+
+func TestTotalRetrans_Nil(t *testing.T) {
+	var s *Stats
+	if got := s.TotalRetrans(); got != 0 {
+		t.Errorf("expected 0 for nil, got %d", got)
+	}
+}
+
+func TestTotalRetrans_ZeroRetransWithSegs(t *testing.T) {
+	// Linux: RetransSegs==0 but SegsOut>0 → should return 0, not fallback to BytesRetrans
+	s := &Stats{SegsOut: 100, RetransSegs: 0, BytesSent: 0, BytesRetrans: 0}
+	if got := s.TotalRetrans(); got != 0 {
+		t.Errorf("expected 0 when RetransSegs==0 and SegsOut>0, got %d", got)
+	}
+}

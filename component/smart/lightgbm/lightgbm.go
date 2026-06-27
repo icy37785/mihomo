@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	MaxFeatureSize = 29
+	MaxFeatureSize = 30
 )
 
 var (
@@ -596,6 +596,11 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 		return smart.CalculateWeight(input, priorityFactor)
 	}
 
+	// 检测模型特征与当前版本是否兼容
+	if transforms != nil && !transforms.IsCompatibleWith(getDefaultFeatureOrder()) {
+		return smart.CalculateWeight(input, priorityFactor)
+	}
+
 	// 应用特征变换
 	if transforms != nil && transforms.TransformsEnabled {
 		features = transforms.ApplyTransforms(features)
@@ -673,7 +678,8 @@ func prepareFeatures(input *smart.ModelInput) []float64 {
 	// 网络协议特征
 	features = append(features, boolToFloat(input.IsUDP)) // 是否UDP协议
 	features = append(features, boolToFloat(input.IsTCP)) // 是否TCP协议
-	features = append(features, input.LossRate)           // 丢包率
+	features = append(features, input.LossRate)           // 单次连接丢包率
+	features = append(features, input.CumulLossRate)      // 历史累计丢包率
 
 	// 2. ASN特征提取
 	asnFeature := extractASNFeature(input.DestIPASN)
@@ -1013,7 +1019,7 @@ func boolToFloat(b bool) float64 {
 	return 0.0
 }
 
-func CreateModelInputFromStatsRecord(atomicRecord *smart.AtomicStatsRecord, metadata *C.Metadata, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration float64, wildcardTarget string, lossRate float64) *smart.ModelInput {
+func CreateModelInputFromStatsRecord(atomicRecord *smart.AtomicStatsRecord, metadata *C.Metadata, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration float64, wildcardTarget string, lossRate, cumulLossRate float64) *smart.ModelInput {
 	input := &smart.ModelInput{
 		Success:                       atomicRecord.Get("success").(int64),
 		Failure:                       atomicRecord.Get("failure").(int64),
@@ -1033,6 +1039,7 @@ func CreateModelInputFromStatsRecord(atomicRecord *smart.AtomicStatsRecord, meta
 		IsUDP:                         metadata.NetWork == C.UDP,
 		IsTCP:                         metadata.NetWork == C.TCP,
 		LossRate:                      lossRate,
+		CumulLossRate:                 cumulLossRate,
 	}
 
 	if metadata.DstIPASN == "unknown" {

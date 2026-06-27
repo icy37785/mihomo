@@ -235,7 +235,7 @@ func (s *Smart) singleDialContext(ctx context.Context, proxy C.Proxy, metadata *
 			return nil, connectTime, err
 		}
 		if !errors.Is(err, context.Canceled) {
-			go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, 0, err)
+			go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, err)
 		}
 		return nil, connectTime, err
 	}
@@ -355,7 +355,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 					return nil, err
 				}
 				finalErr = err
-				go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, 0, err)
+				go s.recordConnectionStats(metadata, proxy, connectTime, 0, 0, 0, 0, 0, 0, nil, err)
 				continue
 			}
 
@@ -1269,7 +1269,7 @@ func formatTimeUnit(val float64) string {
 // 日志记录
 func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadata *C.Metadata, baseWeight, priorityFactor float64,
 	addressDisplay, proxyName string, connectTime int64, latency int64, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
-	connectionDuration int64, asnInfo string, ModelPredicted bool, lossRate float64) {
+	connectionDuration int64, asnInfo string, ModelPredicted bool, lossRate, cumulLossRate float64) {
 
 	var tcpAsnWeight, udpAsnWeight float64
 
@@ -1299,7 +1299,7 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], TCP ASN: [%.4f], UDP ASN: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
 		"For (Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s]) "+
 		"- Current: (Connect: [%s], Latency: [%s], LossRate: [%.2f%%], Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
-		"- History: (Success: [%d], Failure: [%d], Avg Connect: [%s], Avg Latency: [%s], Avg LossRate: [%.2f%%], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
+		"- History: (Success: [%d], Failure: [%d], EMA Connect: [%s], EMA Latency: [%s], Cumul LossRate: [%.2f%%], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
 		statusStr, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], tcpAsnWeight, udpAsnWeight, baseWeight, priorityFactor,
 		s.Name(), proxyName, metadata.NetWork.String(), addressDisplay,
 		formatTimeUnit(float64(connectTime)),
@@ -1313,7 +1313,7 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 		record.Success, record.Failure,
 		formatTimeUnit(float64(record.ConnectTime)),
 		formatTimeUnit(float64(record.Latency)),
-		record.LossRate*100,
+		cumulLossRate*100,
 		formatTrafficUnit(record.UploadTotal*1024*1024, false),
 		formatTrafficUnit(record.DownloadTotal*1024*1024, false),
 		formatTrafficUnit(record.MaxUploadRate*1024, true),
@@ -1342,14 +1342,14 @@ func (s *Smart) collectConnectionData(input *smart.ModelInput, metadata *C.Metad
 	s.dataCollector.AddSample(input, metadata, baseWeight, weightSource)
 }
 
-func updateAverageValueInt(oldValue int64, newValue int64) int64 {
+func updateEMAInt(oldValue int64, newValue int64) int64 {
 	if oldValue > 0 {
 		return (oldValue*2 + newValue*4) / 6
 	}
 	return newValue
 }
 
-func updateAverageValueFloat(oldValue, newValue float64) float64 {
+func updateEMAFloat(oldValue, newValue float64) float64 {
 	if oldValue > 0 {
 		return (oldValue*2 + newValue*4) / 6
 	}
@@ -1358,12 +1358,14 @@ func updateAverageValueFloat(oldValue, newValue float64) float64 {
 
 func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate,
-	connectionDuration int64, lossRate float64, err error) {
+	connectionDuration int64, tcpStats *tcpstats.Stats, err error) {
 
 	if proxy.Type() == C.Compatible || proxy.Type() == C.Reject || proxy.Type() == C.Pass || proxy.Type() == C.RejectDrop {
 		return
 	}
 
+	var lossRate float64
+	var cumulLossRate float64
 	var calculatedWeight float64
 	var ModelPredicted bool
 
@@ -1416,13 +1418,13 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if connectTime > 0 {
 		oldConnectTime := atomicRecord.Get("connectTime").(int64)
-		newConnectTime := updateAverageValueInt(oldConnectTime, connectTime)
+		newConnectTime := updateEMAInt(oldConnectTime, connectTime)
 		atomicRecord.Set("connectTime", newConnectTime)
 	}
 
 	if latency > 0 {
 		oldLatency := atomicRecord.Get("latency").(int64)
-		newLatency := updateAverageValueInt(oldLatency, latency)
+		newLatency := updateEMAInt(oldLatency, latency)
 		atomicRecord.Set("latency", newLatency)
 	}
 
@@ -1430,9 +1432,19 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		s.updateConnectionDuration(atomicRecord, connectionDuration)
 	}
 
+	if tcpStats != nil {
+		atomicRecord.Add("cumulSent", int64(tcpStats.TotalSent()))
+		atomicRecord.Add("cumulRetrans", int64(tcpStats.TotalRetrans()))
+		lossRate = tcpStats.LossRate()
+	}
+
+	if sent := atomicRecord.Get("cumulSent").(int64); sent > 0 {
+		cumulLossRate = float64(atomicRecord.Get("cumulRetrans").(int64)) / float64(sent)
+	}
+
 	if lossRate > 0 {
 		oldLossRate := atomicRecord.Get("lossRate").(float64)
-		newLossRate := updateAverageValueFloat(oldLossRate, lossRate)
+		newLossRate := updateEMAFloat(oldLossRate, lossRate)
 		atomicRecord.Set("lossRate", newLossRate)
 	}
 
@@ -1458,7 +1470,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	input := lightgbm.CreateModelInputFromStatsRecord(
 		atomicRecord, metadata,
 		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration) / 60000.0, wildcardTarget,
-		lossRate,
+		lossRate, cumulLossRate,
 	)
 
 	if s.useLightGBM && s.weightModel != nil {
@@ -1483,7 +1495,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
-	newWeight := updateAverageValueFloat(oldWeight, adjWeight)
+	newWeight := updateEMAFloat(oldWeight, adjWeight)
 	atomicRecord.Set("lastUsed", time.Now().Unix())
 	atomicRecord.SetWeight(weightType, newWeight, isUDP)
 	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
@@ -1505,7 +1517,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
-		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted, lossRate)
+		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted, lossRate, cumulLossRate)
 }
 
 func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error]) C.Conn {
@@ -1523,11 +1535,9 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 			readErr := firstReadErr.Load()
 			writeErr := firstWriteErr.Load()
 
-			var lossRate float64
+			var tcpStats *tcpstats.Stats
 			if trackerConn, ok := tracker.(net.Conn); ok {
-				if tcpStats := tcpstats.GetTCPStats(trackerConn); tcpStats != nil {
-					lossRate = tcpStats.LossRate()
-				}
+				tcpStats = tcpstats.GetTCPStats(trackerConn)
 			}
 
 			var closeErr error
@@ -1541,7 +1551,7 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 				}
 			}
 
-			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, lossRate, closeErr)
+			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, closeErr)
 			return
 		}
 	})
@@ -1559,7 +1569,7 @@ func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Pr
 			maxDownloadRate := info.MaxDownloadRate.Load()
 
 			go s.recordConnectionStats(metadata, proxy, connectTime, udpLatency.Load(),
-				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, 0, nil)
+				uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, nil, nil)
 			return
 		}
 	})

@@ -60,7 +60,8 @@ type ModelInput struct {
 	// 连接特征
 	IsUDP                      bool      // 是否UDP连接
 	IsTCP                      bool      // 是否TCP连接
-	LossRate                   float64   // 丢包率 0.0~1.0, 0=无丢包/不支持/UDP
+	LossRate                   float64   // 单次连接丢包率 0.0~1.0, 0=无丢包/不支持/UDP
+	CumulLossRate              float64   // 历史累计丢包率 cumulRetrans/cumulSent
 
 	// 元数据特征
 	DestIPASN                  string    // 目标IP的ASN信息
@@ -208,9 +209,28 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 	qualityBonus = math.Min(0.3, qualityBonus)
 
 	// 13. 丢包率衰减
+	// currentPenalty: 单次连接丢包，敏感但易波动
+	// cumulPenalty:   历史累计丢包，稳定但反应慢
+	// trustCumul:     累计丢包越高，越信任历史信号
 	lossFactor := 0.0
-	if input.LossRate > 0 {
-		lossFactor = 1.0 - math.Exp(-input.LossRate*10.0)
+	if input.LossRate > 0 || input.CumulLossRate > 0 {
+		currentPenalty := 0.0
+		if input.LossRate > 0 {
+			currentPenalty = 1.0 - math.Exp(-input.LossRate*10.0)
+		}
+
+		cumulPenalty := 0.0
+		if input.CumulLossRate > 0 {
+			cumulPenalty = 1.0 - math.Exp(-input.CumulLossRate*50.0)
+		}
+
+		// trustCumul ∈ [0,1]: 累计丢包率越高，越采纳历史判断
+		trustCumul := math.Min(1.0, cumulPenalty*5.0)
+
+		// 累计可信 → max(当前,累计) 确认性处罚
+		// 累计不可信 → 当前×0.3 疑似瞬态波动，减轻
+		lossFactor = trustCumul*math.Max(currentPenalty, cumulPenalty) +
+			(1.0-trustCumul)*currentPenalty*0.3
 	}
 
 	return baseWeight * (1 +
