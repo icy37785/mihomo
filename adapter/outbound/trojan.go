@@ -308,6 +308,9 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 	if t.jlsConfig != nil && t.realityConfig != nil {
 		return nil, errors.New("JLS is incompatible with REALITY")
 	}
+	if t.jlsConfig != nil && option.SkipTLS {
+		return nil, errors.New("JLS requires TLS")
+	}
 
 	if option.SSOpts.Enabled {
 		if option.SSOpts.Password == "" {

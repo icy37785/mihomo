@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,6 +123,26 @@ func TestTrojanStreamConnContextDefaultsToTLS(t *testing.T) {
 	_ = serverConn.Close()
 	_ = clientConn.Close()
 	<-errCh
+}
+
+func TestTrojanRejectsJLSWithSkipTLS(t *testing.T) {
+	_, err := NewTrojan(TrojanOption{
+		Name:     "jls-skip-tls",
+		Server:   "127.0.0.1",
+		Port:     18443,
+		Password: "password",
+		SkipTLS:  true,
+		JLSOpts: JLSOptions{
+			Username: "user",
+			Password: "pass",
+		},
+	})
+	if err == nil {
+		t.Fatal("NewTrojan expected to reject JLS with skip-tls, got nil error")
+	}
+	if !strings.Contains(err.Error(), "JLS requires TLS") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func testTrojanMetadata() *C.Metadata {
