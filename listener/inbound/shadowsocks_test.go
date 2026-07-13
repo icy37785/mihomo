@@ -11,6 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/listener/inbound"
+	"github.com/metacubex/mihomo/transport/jls"
 	"github.com/metacubex/mihomo/transport/kcptun"
 	"github.com/metacubex/mihomo/transport/restls"
 	shadowtls "github.com/metacubex/mihomo/transport/sing-shadowtls"
@@ -197,6 +198,41 @@ func TestInboundShadowSocks_Restls_tls13(t *testing.T) {
 		PluginOpts: map[string]any{"host": realityDest, "password": shadowsocksPassword16, "fingerprint": tlsFingerprint, "version-hint": "tls13"},
 	}
 	testInboundShadowSocks(t, inboundOptions, outboundOptions, shadowsocksCipherShortLists, false)
+}
+
+func testInboundShadowSocksJLS(t *testing.T, inboundOptions inbound.ShadowSocksOption, outboundOptions outbound.ShadowSocksOption) {
+	t.Parallel()
+	t.Run("Conn", func(t *testing.T) {
+		inboundOptions, outboundOptions := inboundOptions, outboundOptions // don't modify outside options value
+		testInboundShadowSocks(t, inboundOptions, outboundOptions, shadowsocksCipherShortLists, false)
+	})
+	t.Run("UConn", func(t *testing.T) {
+		inboundOptions, outboundOptions := inboundOptions, outboundOptions // don't modify outside options value
+		outboundOptions.ClientFingerprint = "chrome"
+		testInboundShadowSocks(t, inboundOptions, outboundOptions, shadowsocksCipherShortLists, false)
+	})
+}
+
+func TestInboundShadowSocks_JLS(t *testing.T) {
+	username := "jls-user"
+	password := "jls-password"
+	inboundOptions := inbound.ShadowSocksOption{
+		JLSConfig: inbound.JLSConfig{
+			Enable: true,
+			Users:  []inbound.JLSUser{{Username: username, Password: password}},
+			SNI:    realityDest,
+			Dest:   net.JoinHostPort(realityDest, "443"),
+		},
+	}
+	outboundOptions := outbound.ShadowSocksOption{
+		Plugin: jls.Mode,
+		PluginOpts: map[string]any{
+			"host":     realityDest,
+			"username": username,
+			"password": password,
+		},
+	}
+	testInboundShadowSocksJLS(t, inboundOptions, outboundOptions)
 }
 
 func TestInboundShadowSocks_SimpleObfs_Http(t *testing.T) {

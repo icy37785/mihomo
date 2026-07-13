@@ -23,6 +23,8 @@ require (
 	github.com/metacubex/fswatch v0.1.1
 	github.com/metacubex/gopacket v1.1.20-0.20230608035415-7e2f98a3e759
 	github.com/metacubex/http v0.1.6
+	github.com/metacubex/jls-quic-go v0.0.0-20260712113821-d34e6f9b4c7f
+	github.com/metacubex/jls-tls v0.0.0-20260712171131-15870a03ac51
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
 	github.com/metacubex/mlkem v0.1.0
@@ -41,7 +43,7 @@ require (
 	github.com/metacubex/sing-wireguard v0.0.0-20260520151737-7e7c7c1b854c
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/ssh v0.1.0
-	github.com/metacubex/tailscale v0.0.0-20260623094802-1ab893d4162c
+	github.com/metacubex/tailscale v0.0.0-20260711142031-e2257fe61058
 	github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c
 	github.com/metacubex/tls v0.1.7
 	github.com/metacubex/utls v1.8.7

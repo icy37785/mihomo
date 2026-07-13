@@ -18,6 +18,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/gun"
+	"github.com/metacubex/mihomo/transport/jls"
 	"github.com/metacubex/mihomo/transport/mekya"
 	"github.com/metacubex/mihomo/transport/mkcp"
 	mihomoVMess "github.com/metacubex/mihomo/transport/vmess"
@@ -40,8 +41,9 @@ type Vmess struct {
 	gunClient   *gun.Client
 	mekyaClient *mekya.Client
 
-	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
+	jlsConfig     *jls.Config
+	realityConfig *tlsC.RealityConfig
 }
 
 type VmessOption struct {
@@ -57,11 +59,13 @@ type VmessOption struct {
 	TLS                 bool             `proxy:"tls,omitempty"`
 	ALPN                []string         `proxy:"alpn,omitempty"`
 	SkipCertVerify      bool             `proxy:"skip-cert-verify,omitempty"`
+	NameCertVerify      string           `proxy:"name-cert-verify,omitempty"`
 	Fingerprint         string           `proxy:"fingerprint,omitempty"`
 	Certificate         string           `proxy:"certificate,omitempty"`
 	PrivateKey          string           `proxy:"private-key,omitempty"`
 	ServerName          string           `proxy:"servername,omitempty"`
 	ECHOpts             ECHOptions       `proxy:"ech-opts,omitempty"`
+	JLSOpts             JLSOptions       `proxy:"jls-opts,omitempty"`
 	RealityOpts         RealityOptions   `proxy:"reality-opts,omitempty"`
 	TLSMirrorOpts       TLSMirrorOptions `proxy:"tlsmirror-opts,omitempty"`
 	MekyaOpts           MekyaOptions     `proxy:"mekya-opts,omitempty"`
@@ -185,7 +189,24 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		}
 
 		if v.option.TLS {
-			if v.option.TLSMirrorOpts.PrimaryKey != "" {
+			serverName := host
+			if v.option.ServerName != "" {
+				serverName = v.option.ServerName
+			} else if host := wsOpts.Headers.Get("Host"); host != "" {
+				serverName = host
+			}
+
+			if v.jlsConfig != nil {
+				c, err = mihomoVMess.StreamTLSConn(ctx, c, &mihomoVMess.TLSConfig{
+					Host:              serverName,
+					ClientFingerprint: v.option.ClientFingerprint,
+					NextProtos:        []string{"http/1.1"},
+					JLS:               v.jlsConfig,
+				})
+				if err != nil {
+					return nil, err
+				}
+			} else if v.option.TLSMirrorOpts.PrimaryKey != "" {
 				c, err = v.streamTLSConn(ctx, c, false)
 				if err != nil {
 					return nil, err
@@ -194,22 +215,17 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 				wsOpts.TLS = true
 				wsOpts.TLSConfig, err = ca.GetTLSConfig(ca.Option{
 					TLSConfig: &tls.Config{
-						ServerName:         host,
+						ServerName:         serverName,
 						InsecureSkipVerify: v.option.SkipCertVerify,
 						NextProtos:         []string{"http/1.1"},
 					},
-					Fingerprint: v.option.Fingerprint,
-					Certificate: v.option.Certificate,
-					PrivateKey:  v.option.PrivateKey,
+					Fingerprint:    v.option.Fingerprint,
+					NameCertVerify: v.option.NameCertVerify,
+					Certificate:    v.option.Certificate,
+					PrivateKey:     v.option.PrivateKey,
 				})
 				if err != nil {
 					return nil, err
-				}
-
-				if v.option.ServerName != "" {
-					wsOpts.TLSConfig.ServerName = v.option.ServerName
-				} else if host := wsOpts.Headers.Get("Host"); host != "" {
-					wsOpts.TLSConfig.ServerName = host
 				}
 			}
 		}
@@ -321,11 +337,13 @@ func (v *Vmess) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 		tlsOpts := mihomoVMess.TLSConfig{
 			Host:              host,
 			SkipCertVerify:    v.option.SkipCertVerify,
+			NameCertVerify:    v.option.NameCertVerify,
 			FingerPrint:       v.option.Fingerprint,
 			Certificate:       v.option.Certificate,
 			PrivateKey:        v.option.PrivateKey,
 			ClientFingerprint: v.option.ClientFingerprint,
 			ECH:               v.echConfig,
+			JLS:               v.jlsConfig,
 			Reality:           v.realityConfig,
 			NextProtos:        v.option.ALPN,
 			TLSMirror:         v.option.TLSMirrorOpts.Build(),
@@ -477,14 +495,31 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 	}
 	v.dialer = option.NewDialer(v.DialOptions())
 
+	v.echConfig, err = v.option.ECHOpts.Parse()
+	if err != nil {
+		return nil, err
+	}
+	v.jlsConfig, err = option.JLSOpts.Parse()
+	if err != nil {
+		return nil, err
+	}
 	v.realityConfig, err = v.option.RealityOpts.Parse()
 	if err != nil {
 		return nil, err
 	}
-
-	v.echConfig, err = v.option.ECHOpts.Parse()
-	if err != nil {
-		return nil, err
+	if v.jlsConfig != nil {
+		if !option.TLS {
+			return nil, errors.New("JLS requires TLS")
+		}
+		if v.realityConfig != nil {
+			return nil, errors.New("JLS is incompatible with REALITY")
+		}
+		if option.TLSMirrorOpts.PrimaryKey != "" {
+			return nil, errors.New("JLS is incompatible with TLSMirror")
+		}
+		if option.Network == "mkcp" || option.Network == "kcp" {
+			return nil, errors.New("JLS only supports TCP transports")
+		}
 	}
 
 	switch option.Network {
@@ -538,12 +573,14 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 			tlsConfig = &mihomoVMess.TLSConfig{
 				Host:              option.ServerName,
 				SkipCertVerify:    option.SkipCertVerify,
+				NameCertVerify:    option.NameCertVerify,
 				FingerPrint:       option.Fingerprint,
 				Certificate:       option.Certificate,
 				PrivateKey:        option.PrivateKey,
 				ClientFingerprint: option.ClientFingerprint,
 				NextProtos:        []string{"h2"},
 				ECH:               v.echConfig,
+				JLS:               v.jlsConfig,
 				Reality:           v.realityConfig,
 				TLSMirror:         option.TLSMirrorOpts.Build(),
 				TLSMirrorDialer:   proxydialer.New(v, false).DialContext,
