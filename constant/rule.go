@@ -59,6 +59,7 @@ var SmartRuleTypes = map[RuleType]bool{
 	SubRules:          true,
 	AND:               true,
 	OR:                true,
+	NOT:               true,
 }
 
 func (rt RuleType) String() string {

@@ -63,6 +63,7 @@ type ModelInput struct {
 	ConnectionFailed           bool      // 本次连接是否失败（用于区分是复用还是连接失败）
 	LossRate                   float64   // 单次连接丢包率 0.0~1.0, 0=无丢包/不支持/UDP
 	CumulLossRate              float64   // 历史累计丢包率 cumulRetrans/cumulSent
+	EmaLossRate                float64   // 历史EMA丢包率, 自动衰减反映近期趋势
 
 	// 元数据特征
 	DestIPASN                  string    // 目标IP的ASN信息
@@ -212,9 +213,10 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 	qualityBonus = math.Min(0.3, qualityBonus)
 
 	// 13. 丢包率衰减
-	// currentPenalty: 单次连接丢包，敏感但易波动
-	// cumulPenalty:   历史累计丢包，稳定但反应慢
-	// trustCumul:     累计丢包越高，越信任历史信号
+	// currentPenalty:  单次连接丢包，敏感但易波动
+	// cumulPenalty:    历史累计丢包，稳定但永不衰减
+	// emaPenalty:      EMA丢包，自动衰减反映近期趋势
+	// improvementFactor: EMA < 累计 → 质量在改善，降低累计的惩罚权重
 	lossFactor := 0.0
 	if input.LossRate > 0 || input.CumulLossRate > 0 {
 		currentPenalty := 0.0
@@ -227,12 +229,23 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 			cumulPenalty = 1.0 - math.Exp(-input.CumulLossRate*50.0)
 		}
 
+		emaPenalty := 0.0
+		if input.EmaLossRate > 0 {
+			emaPenalty = 1.0 - math.Exp(-input.EmaLossRate*50.0)
+		}
+
 		// trustCumul ∈ [0,1]: 累计丢包率越高，越采纳历史判断
 		trustCumul := math.Min(1.0, cumulPenalty*5.0)
 
-		// 累计可信 → max(当前,累计) 确认性处罚
+		// EMA趋势修正: 当EMA < 累计时说明近期质量改善，按比例降低惩罚
+		improvementFactor := 1.0
+		if cumulPenalty > 0 && emaPenalty > 0 && emaPenalty < cumulPenalty {
+			improvementFactor = emaPenalty / cumulPenalty
+		}
+
+		// 累计可信 → max(当前,累计) * 趋势修正，确认性处罚
 		// 累计不可信 → 当前×0.3 疑似瞬态波动，减轻
-		lossFactor = trustCumul*math.Max(currentPenalty, cumulPenalty) +
+		lossFactor = trustCumul*math.Max(currentPenalty, cumulPenalty)*improvementFactor +
 			(1.0-trustCumul)*currentPenalty*0.3
 	}
 

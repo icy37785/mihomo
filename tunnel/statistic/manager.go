@@ -141,20 +141,10 @@ func (m *Manager) joinSmartTarget(c Tracker) {
 
 	id := c.ID()
 
-	result, ok := m.smartTarget.Load(target)
-	if !ok {
-		result, _ = m.smartTarget.LoadOrStore(target, xsync.NewMap[string, bool]())
-	}
+	result, _ := m.smartTarget.LoadOrStoreFn(target, func() *xsync.Map[string, bool] {
+		return xsync.NewMap[string, bool]()
+	})
 	result.Store(id, true)
-
-	asn := info.Metadata.DstIPASN
-	if asn != "" && asn != "unknown" {
-		result, ok = m.smartTarget.Load(asn)
-		if !ok {
-			result, _ = m.smartTarget.LoadOrStore(asn, xsync.NewMap[string, bool]())
-		}
-		result.Store(id, true)
-	}
 }
 
 func (m *Manager) leaveSmartTarget(c Tracker) {
@@ -170,47 +160,20 @@ func (m *Manager) leaveSmartTarget(c Tracker) {
 	m.smartTarget.Compute(target, func(result *xsync.Map[string, bool], loaded bool) (*xsync.Map[string, bool], xsync.ComputeOp) {
 		if loaded {
 			result.Delete(id)
-			if result.Size() == 0 {
+			if result.IsEmpty() {
 				return result, xsync.DeleteOp
 			}
 			return result, xsync.UpdateOp
 		}
 		return result, xsync.CancelOp
 	})
-
-	asn := info.Metadata.DstIPASN
-	if asn != "" && asn != "unknown" {
-		m.smartTarget.Compute(asn, func(result *xsync.Map[string, bool], loaded bool) (*xsync.Map[string, bool], xsync.ComputeOp) {
-			if loaded {
-				result.Delete(id)
-				if result.Size() == 0 {
-					return result, xsync.DeleteOp
-				}
-				return result, xsync.UpdateOp
-			}
-			return result, xsync.CancelOp
-		})
-	}
 }
 
-func (m *Manager) GetSmartTargetIDs(target, asn string) map[string]bool {
-	targetIDs := make(map[string]bool)
-
+func (m *Manager) RangeSmartTarget(target string, fn func(id string) bool) {
 	if result, ok := m.smartTarget.Load(target); ok {
 		result.Range(func(id string, _ bool) bool {
-			targetIDs[id] = true
-			return true
+			return fn(id)
 		})
 	}
-
-	if asn != "" && asn != "unknown" {
-		if result, ok := m.smartTarget.Load(asn); ok {
-			result.Range(func(id string, _ bool) bool {
-				targetIDs[id] = true
-				return true
-			})
-		}
-	}
-
-	return targetIDs
 }
+
