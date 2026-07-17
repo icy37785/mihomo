@@ -491,13 +491,6 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 					}
 				}
 			}
-			hidden, err := proxyHidden(mapping)
-			if err != nil {
-				return nil, fmt.Errorf("proxy %d hidden error: %w", idx, err)
-			}
-			if !hidden && !matchesFilter(name) {
-				continue
-			}
 			if _, ok := proxiesSet[name]; ok {
 				continue
 			}
@@ -507,9 +500,17 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 				cloned["dialer-proxy"] = dialerProxy
 			}
 
-			err = override.Apply(cloned)
+			err := override.Apply(cloned)
 			if err != nil {
 				return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
+			}
+
+			hidden, err := proxyHidden(cloned)
+			if err != nil {
+				return nil, fmt.Errorf("proxy %d hidden error: %w", idx, err)
+			}
+			if !hidden && !matchesFilter(name) {
+				continue
 			}
 
 			proxy, err := adapter.ParseProxy(cloned, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName), adapter.WithDialerProxyResolver(proxyResolver.Resolve))

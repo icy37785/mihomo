@@ -72,6 +72,60 @@ func TestProviderLocalDialerProxyHiddenProxy(t *testing.T) {
 	_ = conn.Close()
 }
 
+func TestProviderOverrideExprHiddenKeepsFilterExcludedProxy(t *testing.T) {
+	socksAddr, closeSocksServer := startMinimalSocks5Server(t)
+	defer closeSocksServer()
+
+	server, portString, err := net.SplitHostPort(socksAddr)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portString)
+	require.NoError(t, err)
+
+	cfg := &RawConfig{
+		Proxy: []map[string]any{
+			{"name": "outer", "type": "reject"},
+		},
+		ProxyProvider: map[string]map[string]any{
+			"dog": {
+				"type":   "inline",
+				"filter": "inner",
+				"override": map[string]any{
+					"override-expr": []any{`(select(.name == "outer") | .hidden) = true`},
+				},
+				"payload": []map[string]any{
+					{"name": "outer", "type": "direct"},
+					{"name": "inner", "type": "socks5", "server": server, "port": port, "dialer-proxy": "outer"},
+				},
+			},
+		},
+		ProxyGroup: []map[string]any{
+			{"name": "PROXY", "type": "select", "use": []string{"dog"}},
+		},
+	}
+
+	proxies, providers, err := parseProxies(cfg)
+	require.NoError(t, err)
+
+	oldProxies := tunnel.Proxies()
+	oldProviders := tunnel.Providers()
+	tunnel.UpdateProxies(proxies, providers)
+	defer tunnel.UpdateProxies(oldProxies, oldProviders)
+
+	providerProxies := providers["dog"].Proxies()
+	require.Len(t, providerProxies, 1)
+	require.Equal(t, "inner", providerProxies[0].Name())
+
+	// outer is excluded by the filter but must be kept as a hidden local proxy
+	// via override-expr so that inner can dial through it.
+	metadata := &C.Metadata{}
+	require.NoError(t, metadata.SetRemoteAddress("example.com:80"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := providerProxies[0].DialContext(ctx, metadata)
+	require.NoError(t, err)
+	_ = conn.Close()
+}
+
 func startMinimalSocks5Server(t *testing.T) (string, func()) {
 	t.Helper()
 

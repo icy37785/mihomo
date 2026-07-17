@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
@@ -308,8 +309,20 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 	if t.jlsConfig != nil && t.realityConfig != nil {
 		return nil, errors.New("JLS is incompatible with REALITY")
 	}
-	if t.jlsConfig != nil && option.SkipTLS {
-		return nil, errors.New("JLS requires TLS")
+	if option.SkipTLS {
+		network := strings.ToLower(option.Network)
+		if network != "" && network != "tcp" {
+			return nil, fmt.Errorf("skip-tls is only supported for the default tcp network, got network %q", option.Network)
+		}
+		if t.jlsConfig != nil {
+			return nil, errors.New("skip-tls is incompatible with JLS: JLS requires TLS")
+		}
+		if t.realityConfig != nil {
+			return nil, errors.New("skip-tls is incompatible with REALITY: REALITY requires TLS")
+		}
+		if t.echConfig != nil {
+			return nil, errors.New("skip-tls is incompatible with ECH: ECH requires TLS")
+		}
 	}
 
 	if option.SSOpts.Enabled {

@@ -145,6 +145,48 @@ func TestTrojanRejectsJLSWithSkipTLS(t *testing.T) {
 	}
 }
 
+func TestTrojanRejectsSkipTLSWithWSNetwork(t *testing.T) {
+	_, err := NewTrojan(TrojanOption{
+		Name:     "skip-tls-ws",
+		Server:   "127.0.0.1",
+		Port:     18443,
+		Password: "password",
+		SkipTLS:  true,
+		Network:  "ws",
+	})
+	if err == nil || !strings.Contains(err.Error(), "skip-tls is only supported") {
+		t.Fatalf("expected skip-tls/network conflict error, got: %v", err)
+	}
+}
+
+func TestTrojanRejectsECHWithSkipTLS(t *testing.T) {
+	_, err := NewTrojan(TrojanOption{
+		Name:     "skip-tls-ech",
+		Server:   "127.0.0.1",
+		Port:     18443,
+		Password: "password",
+		SkipTLS:  true,
+		ECHOpts:  ECHOptions{Enable: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "skip-tls is incompatible with ECH") {
+		t.Fatalf("expected skip-tls/ECH conflict error, got: %v", err)
+	}
+}
+
+func TestTrojanRejectsRealityWithSkipTLS(t *testing.T) {
+	_, err := NewTrojan(TrojanOption{
+		Name:        "skip-tls-reality",
+		Server:      "127.0.0.1",
+		Port:        18443,
+		Password:    "password",
+		SkipTLS:     true,
+		RealityOpts: RealityOptions{PublicKey: strings.Repeat("A", 43)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "skip-tls is incompatible with REALITY") {
+		t.Fatalf("expected skip-tls/REALITY conflict error, got: %v", err)
+	}
+}
+
 func testTrojanMetadata() *C.Metadata {
 	return &C.Metadata{
 		NetWork: C.TCP,
