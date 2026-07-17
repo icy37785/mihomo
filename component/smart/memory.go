@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
@@ -22,6 +23,12 @@ var (
 	blockedNodesCache *lru.LruCache[string, map[string]bool]
 
 	hostStatusCache *lru.LruCache[string, *HostStatus]
+)
+
+var (
+	targetCacheRefreshFlags    xsync.Map[string, bool]
+	dbResultRefreshFlags       xsync.Map[string, bool]
+	blockedNodesRefreshFlags   xsync.Map[string, bool]
 )
 
 type (
@@ -61,33 +68,39 @@ func InitCache() {
 	globalCacheParams.MaxTargets = MinTargetsLimit
 
 	targetCache = lru.New[string, string](
-		lru.WithSize[string, string](globalCacheParams.MaxTargets / 4),
+		lru.WithSize[string, string](globalCacheParams.MaxTargets / 3),
 		lru.WithAge[string, string](300),
+		lru.WithStale[string, string](true),
 	)
 
 	unwrapCache = lru.New[string, UnwrapMap](
-		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets / 4),
-		lru.WithAge[string, UnwrapMap](1800),
+		lru.WithSize[string, UnwrapMap](globalCacheParams.MaxTargets / 3),
+		lru.WithAge[string, UnwrapMap](600),
+		lru.WithStale[string, UnwrapMap](true),
 	)
 
 	recordCache = lru.New[string, *AtomicStatsRecord](
-		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets / 4),
+		lru.WithSize[string, *AtomicStatsRecord](globalCacheParams.MaxTargets / 3),
 		lru.WithAge[string, *AtomicStatsRecord](300),
+		lru.WithStale[string, *AtomicStatsRecord](true),
 	)
 
 	dbResultCache = lru.New[string, map[string][]byte](
-		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets / 4),
+		lru.WithSize[string, map[string][]byte](globalCacheParams.MaxTargets / 3),
 		lru.WithAge[string, map[string][]byte](300),
+		lru.WithStale[string, map[string][]byte](true),
 	)
 
 	blockedNodesCache = lru.New[string, map[string]bool](
-		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets / 4),
+		lru.WithSize[string, map[string]bool](globalCacheParams.MaxTargets / 3),
 		lru.WithAge[string, map[string]bool](300),
+		lru.WithStale[string, map[string]bool](true),
 	)
 
 	hostStatusCache = lru.New[string, *HostStatus](
-		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets / 4),
+		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets / 3),
 		lru.WithAge[string, *HostStatus](300),
+		lru.WithStale[string, *HostStatus](true),
 	)
 }
 
@@ -211,7 +224,7 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 	return nil, nil
 }
 
-func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, proxies []C.Proxy) {
+func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string, proxies []C.Proxy) {
 	if target == "" || len(proxies) == 0 {
 		return
 	}
@@ -221,103 +234,65 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 		names[i] = p.Name()
 	}
 
+	// SmartTarget (same ruleset = same node)
 	targetKey := FormatDBKey(config, group, target)
+	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
 
+	// ASN sharing (CDN excluded)
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
-		if value, found := unwrapCache.Get(asnKey); found {
-			um := value
-			if len(um.Proxies) == 0 {
-				um.Proxies = names
-				unwrapCache.Set(asnKey, um)
-			}
-		} else {
-			unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
-		}
-
-		if value, found := unwrapCache.Get(targetKey); found {
-			um := value
-			if um.Ref == "" {
-				um.Ref = asnKey
-				unwrapCache.Set(targetKey, um)
-			}
-		} else {
-			unwrapCache.Set(targetKey, UnwrapMap{Ref: asnKey})
-		}
-	} else {
-		if value, found := unwrapCache.Get(targetKey); found {
-			um := value
-			um.Proxies = names
-			unwrapCache.Set(targetKey, um)
-		} else {
-			unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
-		}
+		unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
 	}
 }
 
-func (s *Store) GetUnwrapResult(group, config, target, asnNumber string) []string {
+func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, expired bool) {
 	if target == "" {
-		return nil
+		return nil, false
 	}
 
 	targetKey := FormatDBKey(config, group, target)
-
-	if value, found := unwrapCache.Get(targetKey); found {
-		um := value
-		if um.Ref != "" {
-			if refValue, found := unwrapCache.Get(um.Ref); found {
-				return refValue.Proxies
-			}
-		} else if len(um.Proxies) > 0 {
-			return um.Proxies
+	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
+		if len(value.Proxies) > 0 {
+			return value.Proxies, expireTime.Before(time.Now())
 		}
 	}
 
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
-		if value, found := unwrapCache.Get(asnKey); found {
-			return value.Proxies
+		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
+			if len(value.Proxies) > 0 {
+				unwrapCache.Set(targetKey, UnwrapMap{Proxies: value.Proxies})
+				return value.Proxies, expireTime.Before(time.Now())
+			}
 		}
 	}
 
-	return nil
+	return nil, false
 }
 
-func (s *Store) DeleteUnwrapResult(group, config string, target string, asnNumber string) {
+func (s *Store) DeleteUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string) {
 	if target == "" {
 		return
 	}
 
 	targetKey := FormatDBKey(config, group, target)
-
-	if value, found := unwrapCache.Get(targetKey); found {
-		um := value
-		um.Proxies = nil
-		um.Ref = ""
-		if len(um.Proxies) == 0 && um.Ref == "" {
-			unwrapCache.Delete(targetKey)
-		} else {
-			unwrapCache.Set(targetKey, um)
-		}
-	}
+	unwrapCache.Delete(targetKey)
 
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
-		if value, found := unwrapCache.Get(asnKey); found {
-			um := value
-			um.Proxies = nil
-			if len(um.Proxies) == 0 {
-				unwrapCache.Delete(asnKey)
-			} else {
-				unwrapCache.Set(asnKey, um)
-			}
-		}
+		unwrapCache.Delete(asnKey)
 	}
 }
 
 func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string]*NodeState) {
 	cacheKey := FormatDBKey(config, group)
-	blocked := s.GetBlockedNodes(group, config)
+	blocked, _, _ := blockedNodesCache.GetWithExpire(cacheKey)
+
+	newBlocked := make(map[string]bool, len(blocked)+len(updates))
+	for k, v := range blocked {
+		newBlocked[k] = v
+	}
+
 	now := time.Now().Unix()
 
 	for node, state := range updates {
@@ -325,13 +300,13 @@ func (s *Store) UpdateBlockedNodesCache(group, config string, updates map[string
 			continue
 		}
 		if state.BlockedUntil > 0 && state.BlockedUntil > now {
-			blocked[node] = true
+			newBlocked[node] = true
 		} else {
-			delete(blocked, node)
+			delete(newBlocked, node)
 		}
 	}
 
-	blockedNodesCache.Set(cacheKey, blocked)
+	blockedNodesCache.Set(cacheKey, newBlocked)
 }
 
 // 调整缓存参数
@@ -369,12 +344,12 @@ func (s *Store) AdjustCacheParameters() {
 		globalCacheParams.BatchSaveThreshold)
 
 	cacheSize := globalCacheParams.MaxTargets / 4
-	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300))
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](1800))
-	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300))
-	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300))
-	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300))
-	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300))
+	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300), lru.WithStale[string, string](true))
+	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](600), lru.WithStale[string, UnwrapMap](true))
+	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300), lru.WithStale[string, *AtomicStatsRecord](true))
+	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300), lru.WithStale[string, map[string][]byte](true))
+	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300), lru.WithStale[string, map[string]bool](true))
+	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300), lru.WithStale[string, *HostStatus](true))
 	go s.FlushQueue(true)
 }
 

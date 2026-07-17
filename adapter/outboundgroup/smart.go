@@ -89,7 +89,8 @@ type Smart struct {
 	sampleRate             float64
 	useLightGBM            bool
 	collectData            bool
-	preferASN	           bool
+	preferASN              bool
+	hostFailLimit          int
 }
 
 type dialResult struct {
@@ -149,6 +150,8 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		collectData:          smartOption.CollectData,
 		preferASN:            smartOption.PreferASN,
 	}
+
+	s.hostFailLimit = s.maxFailedTimes
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
@@ -301,19 +304,19 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 				}
 				finalErr = err
 			} else {
-				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, []C.Proxy{p})
+				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
+				s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
 
-		if len(proxies) == 1 {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber)
-		}
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
 
 		return nil, finalErr
 	}
 
 	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+
 	return tryDial(proxies, asnNumber)
 }
 
@@ -321,6 +324,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	var finalErr error
 
 	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+
 	limit := len(proxies)
 	if limit > maxSelected {
 		limit = maxSelected
@@ -359,15 +363,17 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 				continue
 			}
 
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, []C.Proxy{proxy})
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
+			s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
 			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
 		}
 
 		if singleProxyRetry {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber)
 			break
 		}
 	}
+
+	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
 
 	return nil, finalErr
 }
@@ -520,7 +526,7 @@ func (s *Smart) Proxies() []C.Proxy {
 
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
-	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
+	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
@@ -530,18 +536,37 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		}
 	}
 
+	checkNodeUsed := make(map[string]bool, len(names)+len(wtFailNodes))
+
 	selected := make([]C.Proxy, 0, minCount+1)
+	var failedSelected []C.Proxy
+
 	for i, name := range names {
+		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
-		if proxy != nil && !blockedNodes[name] && (wtBlocked || !wtFailNodes[name]) && proxy.AliveForTestUrl(s.testUrl) && (!isUDP || proxy.SupportUDP()) {
-			w := 0.0
-			if weights != nil && i < len(weights) {
-				w = weights[i]
-			}
-			if weights == nil || w >= smart.AllowedWeight {
-				selected = append(selected, proxy)
-			}
+		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
+			continue
 		}
+		w := 0.0
+		if weights != nil && i < len(weights) {
+			w = weights[i]
+		}
+		if weights != nil && w < smart.AllowedWeight {
+			continue
+		}
+		if wtFailNodes[name] {
+			failedSelected = append(failedSelected, proxy)
+		} else {
+			selected = append(selected, proxy)
+		}
+	}
+
+	if wtBlocked {
+		selected = append(selected, failedSelected...)
+	}
+
+	for name := range wtFailNodes {
+		checkNodeUsed[name] = true
 	}
 
 	// Unwrap result should not filled
@@ -562,11 +587,12 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	type sortKey struct {
 		delay  uint16
 		factor float64
+		index  int
 	}
 	allKeys := make(map[string]sortKey, len(all))
-	for _, p := range all {
+	for i, p := range all {
 		name := p.Name()
-		k := sortKey{delay: p.LastDelayForTestUrl(s.testUrl)}
+		k := sortKey{delay: p.LastDelayForTestUrl(s.testUrl), index: i}
 		if hasPriority {
 			k.factor = s.getPriorityFactor(name)
 		}
@@ -574,7 +600,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	}
 
 	defaultSort := func(proxies []C.Proxy) []C.Proxy {
-		sort.Slice(proxies, func(i, j int) bool {
+		sort.SliceStable(proxies, func(i, j int) bool {
 			ni, nj := proxies[i].Name(), proxies[j].Name()
 			ki, kj := allKeys[ni], allKeys[nj]
 			if hasPriority && ki.factor != kj.factor {
@@ -583,22 +609,12 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			if ki.delay != kj.delay {
 				return ki.delay < kj.delay
 			}
-			return ni < nj
+			return ki.index < kj.index
 		})
 		return proxies
 	}
 
 	filteredAll := make([]C.Proxy, 0, len(all))
-
-	checkNodeUsed := make(map[string]bool, len(names)+len(wtFailNodes))
-	for _, name := range names {
-		checkNodeUsed[name] = true
-	}
-	if len(wtFailNodes) > 0 && !wtBlocked {
-		for name := range wtFailNodes {
-			checkNodeUsed[name] = true
-		}
-	}
 
 	for _, p := range all {
 		name := p.Name()
@@ -680,6 +696,7 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 	// 添加ASN信息
 	asnNumber := s.getASNCode(metadata)
 	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	metadata.WildcardTarget = wildcardTarget
 	if metadata.SmartTarget == "" {
 		metadata.SmartTarget = wildcardTarget
 	}
@@ -692,23 +709,48 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		}
 	}
 
-	trySelector := func(isUDP bool) ([]string, []float64) {
-		// 检查匹配缓存
-		if proxiesName := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber); len(proxiesName) > 0 {
-			return proxiesName, nil
-		}
-
-		// 检查预解析缓存
+	// 预解析缓存或实时计算
+	computeFreshNodes := func(isUDP bool) ([]string, []float64) {
 		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
 			return proxiesName, weights
 		}
-
-		// 实时计算最佳节点
 		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
 			return proxiesName, weights
 		}
-
 		return nil, nil
+	}
+
+	// 异步更新过期缓存（stale-while-revalidate）
+	refreshUnwrapCache := func(isUDP bool) {
+		names, _ := computeFreshNodes(isUDP)
+		if len(names) == 0 {
+			return
+		}
+		allProxies := s.GetProxies(true)
+		proxyByName := make(map[string]C.Proxy, len(allProxies))
+		for _, p := range allProxies {
+			proxyByName[p.Name()] = p
+		}
+		resultProxies := make([]C.Proxy, 0, len(names))
+		for _, name := range names {
+			if p, ok := proxyByName[name]; ok {
+				resultProxies = append(resultProxies, p)
+			}
+		}
+		if len(resultProxies) > 0 {
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies)
+		}
+	}
+
+	trySelector := func(isUDP bool) ([]string, []float64) {
+		// 检查匹配缓存
+		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
+			if expired {
+				go refreshUnwrapCache(isUDP)
+			}
+			return proxiesName, nil
+		}
+		return computeFreshNodes(isUDP)
 	}
 
 	isUDP := metadata.NetWork == C.UDP
@@ -743,6 +785,7 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(5*time.Minute, rankingInterval, "Group nodes Ranking", s.updateNodeRanking, false)
 	s.startTimedTask(5*time.Minute, recoveryCheckInterval, "Group nodes recovery check", s.checkBlockedNodes, false)
 	s.startTimedTask(15*time.Minute, hostStatusCheckInterval, "Group host status check", s.checkHostStatus, false)
+	s.startTimedTask(1*time.Minute, prefetchInterval, "Group maxFailedTimes refresh", s.applyMaxFailedTimes, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group old records clean up", func() {
 		s.store.CleanupOldRecords(s.Name(), s.configName)
 	}, false)
@@ -1207,7 +1250,7 @@ func (s *Smart) checkBlockedNodes() {
 			continue
 		}
 
-		if state.BlockedUntil > 0 && state.BlockedUntil > time.Now().Unix() {
+		if state.BlockedUntil > 0 && state.BlockedUntil <= time.Now().Unix() {
 			state.BlockedUntil = 0
 			nodesToUpdate[nodeName] = &state
 			log.Debugln("[Smart] Node [%s] block period expired, unblocking", nodeName)
@@ -1251,16 +1294,10 @@ func formatTrafficUnit(val float64, isSpeed bool) string {
 
 func formatTimeUnit(val float64) string {
 	units := []string{"ms", "s", "min", "h"}
-	base := 1000.0
+	thresholds := []float64{1000.0, 60.0, 60.0}
 	i := 0
-	for val >= base && i < len(units)-1 {
-		if i == 0 {
-			val /= base
-		} else if i == 1 {
-			val /= 60
-		} else if i == 2 {
-			val /= 60
-		}
+	for i < len(units)-1 && val >= thresholds[i] {
+		val /= thresholds[i]
 		i++
 	}
 	return fmt.Sprintf("%.2f %s", val, units[i])
@@ -1269,13 +1306,13 @@ func formatTimeUnit(val float64) string {
 // 日志记录
 func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadata *C.Metadata, baseWeight, priorityFactor float64,
 	addressDisplay, proxyName string, connectTime int64, latency int64, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate float64,
-	connectionDuration int64, asnInfo string, ModelPredicted bool, lossRate, cumulLossRate float64) {
+	connectionDuration int64, asnNumber string, ModelPredicted bool, lossRate, cumulLossRate float64) {
 
 	var tcpAsnWeight, udpAsnWeight float64
 
-	if asnInfo != "" {
-		tcpAsnWeightKey := smart.WeightTypeTCPASN + ":" + asnInfo
-		udpAsnWeightKey := smart.WeightTypeUDPASN + ":" + asnInfo
+	if asnNumber != "" {
+		tcpAsnWeightKey := smart.WeightTypeTCPASN + ":" + asnNumber
+		udpAsnWeightKey := smart.WeightTypeUDPASN + ":" + asnNumber
 		if record.Weights != nil {
 			if w, ok := record.Weights[tcpAsnWeightKey]; ok {
 				tcpAsnWeight = w
@@ -1374,28 +1411,28 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	networkStr := metadata.NetWork.String()
 
 	target := metadata.SmartTarget
-	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	wildcardTarget := metadata.WildcardTarget
 	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
-	asnInfo := s.getASNCode(metadata)
+	asnNumber := s.getASNCode(metadata)
 	priorityFactor := s.getPriorityFactor(proxyName)
 
 	asnDisplay := "unknown"
-	if asnInfo != "" {
-		asnDisplay = asnInfo
+	if asnNumber != "" {
+		asnDisplay = asnNumber
 	}
 	var addressDisplay string
 	if metadata.Host != "" {
-		addressDisplay = fmt.Sprintf("Host: [%s] - Target: [%s] - ASN: [%s]", metadata.Host, target, asnDisplay)
+		addressDisplay = fmt.Sprintf("Host: [%s] - Target: [%s] - WildcardTarget: [%s] - ASN: [%s]", metadata.Host, target, wildcardTarget, asnDisplay)
 	} else {
 		addressDisplay = fmt.Sprintf("IP: [%s] - Target: [%s] - ASN: [%s]", metadata.DstIP.String(), target, asnDisplay)
 	}
 
 	weightType := smart.WeightTypeTCP
-	if asnInfo != "" {
+	if asnNumber != "" {
 		if isUDP {
-			weightType = smart.WeightTypeUDPASN + ":" + asnInfo
+			weightType = smart.WeightTypeUDPASN + ":" + asnNumber
 		} else {
-			weightType = smart.WeightTypeTCPASN + ":" + asnInfo
+			weightType = smart.WeightTypeTCPASN + ":" + asnNumber
 		}
 	} else if isUDP {
 		weightType = smart.WeightTypeUDP
@@ -1442,11 +1479,9 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		cumulLossRate = float64(atomicRecord.Get("cumulRetrans").(int64)) / float64(sent)
 	}
 
-	if lossRate > 0 {
-		oldLossRate := atomicRecord.Get("lossRate").(float64)
-		newLossRate := updateEMAFloat(oldLossRate, lossRate)
-		atomicRecord.Set("lossRate", newLossRate)
-	}
+	emaLossRate := atomicRecord.Get("lossRate").(float64)
+	emaLossRate = updateEMAFloat(emaLossRate, lossRate)
+	atomicRecord.Set("lossRate", emaLossRate)
 
 	oldWeight := atomicRecord.GetWeight(weightType)
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
@@ -1486,13 +1521,13 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		err, metadata, proxy, wildcardTarget,
 		addressDisplay, proxyName, calculatedWeight, oldWeight,
 		connectionDuration, uploadTotalMB, downloadTotalMB,
-		networkStr, asnInfo, isUDP)
+		networkStr, asnNumber, isUDP, lossRate, emaLossRate)
 
-	// 针对具体 域名/IP 屏蔽节点
-	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, isDegraded, checked, blockCode)
-
+	// 针对具体 域名/IP 屏蔽节点（wildcardTarget + SmartTarget 双级记录）
+	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
+	
 	if isDegraded || failedBlock {
-		s.findSameConnection(metadata, proxyName, target, asnInfo)
+		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
 	}
 
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
@@ -1518,7 +1553,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
-		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted, lossRate, cumulLossRate)
+		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnNumber, ModelPredicted, lossRate, cumulLossRate)
 }
 
 func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error]) C.Conn {
@@ -1552,6 +1587,10 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 				}
 			}
 
+			if closeErr != nil {
+				s.markNodeFailure(metadata, proxy.Name(), true, true, 3)
+			}
+
 			go s.recordConnectionStats(metadata, proxy, connectTime, latency, uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, tcpStats, closeErr)
 			return
 		}
@@ -1581,7 +1620,7 @@ func (s *Smart) checkNodeQuality(
 	addressDisplay, proxyName string,
 	newWeight, oldWeight float64,
 	connectionDuration int64, uploadTotal, downloadTotal float64,
-	networkType string, asnInfo string, isUDP bool) (float64, bool, bool, int64) {
+	networkType string, asnNumber string, isUDP bool, lossRate, emaLossRate float64) (float64, bool, bool, int64) {
 
 	if s.selected != "" {
 		return newWeight, false, false, 0
@@ -1641,25 +1680,53 @@ func (s *Smart) checkNodeQuality(
 		return newWeight, false, checked, 0
 	}
 
+	// 高丢包率检测
+	if lossRate >= 0.1 || emaLossRate >= 0.05 {
+		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected high packet loss [current: %.2f%%, history EMA: %.2f%%]...",
+			s.Name(), proxyName, networkType, addressDisplay, lossRate*100, emaLossRate*100)
+		return newWeight, true, true, 6
+	}
+
 	return newWeight, false, false, 0
 }
 
-func (s *Smart) findSameConnection(metadata *C.Metadata, proxyName, target, asnInfo string) {
-	allIDs := statistic.DefaultManager.GetSmartTargetIDs(target, asnInfo)
+func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode int64) bool {
+	wildcardTarget := metadata.WildcardTarget
+	target := metadata.SmartTarget
 
-	for id := range allIDs {
-		if tracker := statistic.DefaultManager.Get(id); tracker != nil {
-			if id != metadata.UUID && lo.Contains(tracker.Chains(), s.Name()) {
-				if lo.Contains(tracker.Chains(), proxyName) {
-					tracker.Info().Metadata.SmartBlock = "degraded"
-				}
-				_ = tracker.Close()
-			}
+	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
+
+	if isDegraded || failedBlock {
+		if target != "" && target != wildcardTarget {
+			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
 		}
 	}
 
-	s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnInfo)
+	return failedBlock
+}
 
+func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asnNumber string, isDegraded bool) {
+	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
+		if id == metadata.UUID {
+			return true
+		}
+		tracker := statistic.DefaultManager.Get(id)
+		if tracker == nil {
+			return true
+		}
+		if !lo.Contains(tracker.Chains(), s.Name()) {
+			return true
+		}
+		if isDegraded {
+			tracker.Info().Metadata.SmartBlock = "degraded"
+			_ = tracker.Close()
+		} else if proxyName != "" {
+			if !lo.Contains(tracker.Chains(), proxyName) {
+				_ = tracker.Close()
+			}
+		}
+		return true
+	})
 }
 
 func (s *Smart) checkHostStatus() {
@@ -1682,7 +1749,7 @@ func (s *Smart) checkHostStatus() {
 			}
 			status, okRes, err := s.StatusTest(p, host)
 			if err == nil && okRes {
-				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, false, true, 0)
+				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, s.hostFailLimit, false, true, 0)
 				log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] with HTTP Status: [%d]", s.Name(), nodeName, host, status)
 			} else if err == nil {
 				log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] still abnormal with HTTP Status: [%d]", s.Name(), nodeName, host, status)
@@ -1719,6 +1786,15 @@ func (s *Smart) getPriorityFactor(proxyName string) float64 {
 	}
 	s.priorityCache.Store(proxyName, factor)
 	return factor
+}
+
+func (s *Smart) applyMaxFailedTimes() {
+	if proxyCount := len(s.GetProxies(true)); proxyCount > 0 && s.hostFailLimit >= proxyCount {
+		s.hostFailLimit = proxyCount - 1
+		if s.hostFailLimit < 1 {
+			s.hostFailLimit = 1
+		}
+	}
 }
 
 func applyPolicyPriority(s *Smart, policyPriority string) {
