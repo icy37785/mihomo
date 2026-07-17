@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/metacubex/bbolt"
 	"github.com/metacubex/mihomo/log"
@@ -216,8 +217,21 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	}
 
 	if hasGroupLevel && maxResults > 0 {
-		if cachedGroup, ok := dbResultCache.Get(groupPrefix); ok {
+		if cachedGroup, expireTime, ok := dbResultCache.GetWithExpire(groupPrefix); ok {
+			isStale := expireTime.Before(time.Now())
 			merged := mergeIntoByPrefix(cachedGroup, result, prefix, strict)
+
+			if isStale {
+				if _, loading := dbResultRefreshFlags.LoadOrStore(groupPrefix, true); !loading {
+					go func() {
+						defer dbResultRefreshFlags.Delete(groupPrefix)
+						if groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false); err == nil {
+							dbResultCache.Set(groupPrefix, groupResult)
+						}
+					}()
+				}
+			}
+
 			if depth == 4 || merged > 0 {
 				return result, nil
 			}
@@ -225,29 +239,37 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false)
 				if err == nil {
 					dbResultCache.Set(groupPrefix, groupResult)
-					merged = mergeIntoByPrefix(groupResult, result, prefix, strict)
-					if depth == 4 || merged > 0 {
-						return result, nil
-					}
+					_ = mergeIntoByPrefix(groupResult, result, prefix, strict)
 				}
 			}
 		} else {
 			groupResult, err := s.DBViewPrefixScan(groupPrefix, maxResults, false)
 			if err == nil {
 				dbResultCache.Set(groupPrefix, groupResult)
-				merged := mergeIntoByPrefix(groupResult, result, prefix, strict)
-				if depth == 4 || merged > 0 {
-					return result, nil
-				}
+				_ = mergeIntoByPrefix(groupResult, result, prefix, strict)
 			}
 		}
 		return result, nil
 	}
 
-	if cached, ok := dbResultCache.Get(prefix); ok && maxResults > 0 {
+	if cached, expireTime, ok := dbResultCache.GetWithExpire(prefix); ok && maxResults > 0 {
+		isStale := expireTime.Before(time.Now())
 		for k, v := range cached {
 			if _, exists := result[k]; !exists {
 				result[k] = v
+			}
+		}
+
+		if isStale && !hasGroupLevel {
+			if keyType != KeyTypeStats && keyType != KeyTypeHostFailures {
+				if _, loading := dbResultRefreshFlags.LoadOrStore(prefix, true); !loading {
+					go func() {
+						defer dbResultRefreshFlags.Delete(prefix)
+						if dbResult, err := s.DBViewPrefixScan(prefix, maxResults, strict); err == nil {
+							dbResultCache.Set(prefix, dbResult)
+						}
+					}()
+				}
 			}
 		}
 	} else {

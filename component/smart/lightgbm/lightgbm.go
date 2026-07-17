@@ -1040,6 +1040,7 @@ func CreateModelInputFromStatsRecord(atomicRecord *smart.AtomicStatsRecord, meta
 		IsTCP:                         metadata.NetWork == C.TCP,
 		LossRate:                      lossRate,
 		CumulLossRate:                 cumulLossRate,
+		EmaLossRate:                   atomicRecord.Get("lossRate").(float64),
 	}
 
 	if metadata.DstIPASN == "unknown" {

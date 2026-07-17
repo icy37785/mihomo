@@ -133,41 +133,38 @@ func GetTargetNodeLock(target, group, proxy string) *sync.RWMutex {
 
 // 获取或创建原子记录
 func (s *Store) GetOrCreateAtomicRecord(cacheKey string, group, config, target, proxy string) *AtomicStatsRecord {
-	if value, ok := recordCache.Get(cacheKey); ok {
-		return value
-	}
+	record, _ := recordCache.GetOrStore(cacheKey, func() *AtomicStatsRecord {
+		r := &AtomicStatsRecord{
+			weights: lru.New[string, float64](lru.WithSize[string, float64](100)),
+		}
 
-	record := &AtomicStatsRecord{
-		weights:         lru.New[string, float64](lru.WithSize[string, float64](100)),
-	}
-
-	if existingData, err := s.GetStatsForTarget(group, config, target, proxy); err == nil {
-		if data, exists := existingData[proxy]; exists {
-			var existingRecord StatsRecord
-			if json.Unmarshal(data, &existingRecord) == nil {
-				record.success.Store(existingRecord.Success)
-				record.failure.Store(existingRecord.Failure)
-				record.connectTime.Store(existingRecord.ConnectTime)
-				record.latency.Store(existingRecord.Latency)
-				record.lastUsed.Store(existingRecord.LastUsed)
-				record.uploadTotal.Store(existingRecord.UploadTotal)
-				record.downloadTotal.Store(existingRecord.DownloadTotal)
-				record.duration.Store(existingRecord.ConnectionDuration)
-				record.maxUploadRate.Store(existingRecord.MaxUploadRate)
-				record.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
-				record.lossRate.Store(existingRecord.LossRate)
-				record.cumulSent.Store(int64(existingRecord.CumulSent))
-				record.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
-				if existingRecord.Weights != nil {
-					for k, v := range existingRecord.Weights {
-						record.weights.Set(k, v)
+		if existingData, err := s.GetStatsForTarget(group, config, target, proxy); err == nil {
+			if data, exists := existingData[proxy]; exists {
+				var existingRecord StatsRecord
+				if json.Unmarshal(data, &existingRecord) == nil {
+					r.success.Store(existingRecord.Success)
+					r.failure.Store(existingRecord.Failure)
+					r.connectTime.Store(existingRecord.ConnectTime)
+					r.latency.Store(existingRecord.Latency)
+					r.lastUsed.Store(existingRecord.LastUsed)
+					r.uploadTotal.Store(existingRecord.UploadTotal)
+					r.downloadTotal.Store(existingRecord.DownloadTotal)
+					r.duration.Store(existingRecord.ConnectionDuration)
+					r.maxUploadRate.Store(existingRecord.MaxUploadRate)
+					r.maxDownloadRate.Store(existingRecord.MaxDownloadRate)
+					r.lossRate.Store(existingRecord.LossRate)
+					r.cumulSent.Store(int64(existingRecord.CumulSent))
+					r.cumulRetrans.Store(int64(existingRecord.CumulRetrans))
+					if existingRecord.Weights != nil {
+						for k, v := range existingRecord.Weights {
+							r.weights.Set(k, v)
+						}
 					}
 				}
 			}
 		}
-	}
-
-	recordCache.Set(cacheKey, record)
+		return r
+	})
 	return record
 }
 
@@ -1020,23 +1017,19 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 	return prefetchCount
 }
 
-// GetBlockedNodes 获取被屏蔽节点
-func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
+func (s *Store) loadBlockedNodes(group, config string) map[string]bool {
 	cacheKey := FormatDBKey(config, group)
-	if cached, ok := blockedNodesCache.Get(cacheKey); ok {
-		return cached
-	}
-
 	stateData, err := s.GetNodeStates(group, config)
 	if err != nil {
 		return nil
 	}
+	now := time.Now().Unix()
 	blockedNodes := make(map[string]bool)
 
 	for nodeName, data := range stateData {
 		var state NodeState
 		if json.Unmarshal(data, &state) == nil {
-			if state.BlockedUntil > 0 && state.BlockedUntil > time.Now().Unix() {
+			if state.BlockedUntil > 0 && state.BlockedUntil > now {
 				blockedNodes[nodeName] = true
 			}
 		}
@@ -1044,6 +1037,23 @@ func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
 
 	blockedNodesCache.Set(cacheKey, blockedNodes)
 	return blockedNodes
+}
+
+// GetBlockedNodes 获取被屏蔽节点
+func (s *Store) GetBlockedNodes(group, config string) map[string]bool {
+	cacheKey := FormatDBKey(config, group)
+	if cached, expireTime, ok := blockedNodesCache.GetWithExpire(cacheKey); ok {
+		if expireTime.Before(time.Now()) {
+			if _, loading := blockedNodesRefreshFlags.LoadOrStore(cacheKey, true); !loading {
+				go func() {
+					defer blockedNodesRefreshFlags.Delete(cacheKey)
+					s.loadBlockedNodes(group, config)
+				}()
+			}
+		}
+		return cached
+	}
+	return s.loadBlockedNodes(group, config)
 }
 
 // GetNodeStates 获取节点状态
@@ -1204,40 +1214,56 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 }
 
 // 域名失败屏蔽
-func (s *Store) GetHostStatus(group, config, wildcardTarget string) (map[string]bool, int64, int64, bool) {
-	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
-
+func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets ...string) (failNodes map[string]bool, lastCheck int64, lastFailure int64, blocked bool) {
 	now := time.Now().Unix()
-	resultNodes := make(map[string]bool)
 
-	hs, _ := hostStatusCache.GetOrStore(pathPrefix, func() *HostStatus { return &HostStatus{} })
-
-	hs.initOnce.Do(func() {
-		rawResult, err := s.GetSubBytesByPath(pathPrefix)
-		if err == nil {
-			for _, data := range rawResult {
-				if err := json.Unmarshal(data, hs); err == nil {
-					break
+	lookup := func(pathPrefix string) (nodes map[string]bool, lastCheck int64, lastFailure int64, blocked bool) {
+		hs, _ := hostStatusCache.GetOrStore(pathPrefix, func() *HostStatus { return &HostStatus{} })
+		hs.initOnce.Do(func() {
+			if rawResult, err := s.GetSubBytesByPath(pathPrefix); err == nil {
+				for _, data := range rawResult {
+					if json.Unmarshal(data, hs) == nil {
+						break
+					}
+				}
+			}
+		})
+		hs.mu.RLock()
+		defer hs.mu.RUnlock()
+		for _, codeSet := range hs.Codes {
+			if codeSet == nil {
+				continue
+			}
+			for nodeName, nodeEntry := range codeSet.Nodes {
+				if nodeEntry == 0 || nodeEntry > now {
+					if nodes == nil {
+						nodes = make(map[string]bool)
+					}
+					nodes[nodeName] = true
 				}
 			}
 		}
-	})
+		return nodes, hs.LastCheck, hs.LastFailure, hs.Blocked
+	}
 
-	hs.mu.RLock()
-	defer hs.mu.RUnlock()
+	failNodes, lastCheck, lastFailure, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))
 
-	for _, codeSet := range hs.Codes {
-		if codeSet == nil {
+	for _, extraTarget := range extraTargets {
+		if extraTarget == "" || extraTarget == wildcardTarget {
 			continue
 		}
-		for nodeName, nodeEntry := range codeSet.Nodes {
-			if nodeEntry == 0 || nodeEntry > now {
-				resultNodes[nodeName] = true
+		if extraNodes, _, _, _ := lookup(FormatDBKey(KeyTypeHostFailures, config, group, extraTarget)); len(extraNodes) > 0 {
+			if failNodes == nil {
+				failNodes = extraNodes
+			} else {
+				for k, v := range extraNodes {
+					failNodes[k] = v
+				}
 			}
 		}
 	}
 
-	return resultNodes, hs.LastCheck, hs.LastFailure, hs.Blocked
+	return
 }
 
 func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, failure, checked bool, statusCode int64) bool {
@@ -1289,18 +1315,16 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			continue
 		}
 		if code == 2 {
-			if hs.Blocked {
-				for nodeName, nodeEntry := range codeSet.Nodes {
-					if nodeEntry != 0 && nodeEntry <= now {
-						delete(codeSet.Nodes, nodeName)
-						if codeSet.NodeHosts != nil {
-							delete(codeSet.NodeHosts, nodeName)
-						}
+			for nodeName, nodeEntry := range codeSet.Nodes {
+				if nodeEntry != 0 && nodeEntry <= now {
+					delete(codeSet.Nodes, nodeName)
+					if codeSet.NodeHosts != nil {
+						delete(codeSet.NodeHosts, nodeName)
 					}
 				}
-				if len(codeSet.Nodes) == 0 {
-					delete(hs.Codes, code)
-				}
+			}
+			if len(codeSet.Nodes) == 0 {
+				delete(hs.Codes, code)
 			}
 			continue
 		}
