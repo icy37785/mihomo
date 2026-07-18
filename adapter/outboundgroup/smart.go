@@ -90,6 +90,7 @@ type Smart struct {
 	useLightGBM            bool
 	collectData            bool
 	preferASN              bool
+	hostFailLimit          int
 }
 
 type dialResult struct {
@@ -149,6 +150,8 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		collectData:          smartOption.CollectData,
 		preferASN:            smartOption.PreferASN,
 	}
+
+	s.hostFailLimit = s.maxFailedTimes
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
@@ -1421,7 +1424,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 	var addressDisplay string
 	if metadata.Host != "" {
-		addressDisplay = fmt.Sprintf("Host: [%s] - Target: [%s] - ASN: [%s]", metadata.Host, target, asnDisplay)
+		addressDisplay = fmt.Sprintf("Host: [%s] - Target: [%s] - WildcardTarget: [%s] - ASN: [%s]", metadata.Host, target, wildcardTarget, asnDisplay)
 	} else {
 		addressDisplay = fmt.Sprintf("IP: [%s] - Target: [%s] - ASN: [%s]", metadata.DstIP.String(), target, asnDisplay)
 	}
@@ -1479,10 +1482,8 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	emaLossRate := atomicRecord.Get("lossRate").(float64)
-	if lossRate > 0 {
-		emaLossRate = updateEMAFloat(emaLossRate, lossRate)
-		atomicRecord.Set("lossRate", emaLossRate)
-	}
+	emaLossRate = updateEMAFloat(emaLossRate, lossRate)
+	atomicRecord.Set("lossRate", emaLossRate)
 
 	oldWeight := atomicRecord.GetWeight(weightType)
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
@@ -1527,8 +1528,8 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// 针对具体 域名/IP 屏蔽节点（wildcardTarget + SmartTarget 双级记录）
 	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
 	
-	if blockCode == 1 {
-		s.closeSameConnection(metadata, proxyName, target, asnNumber, true, "")
+	if isDegraded || failedBlock {
+		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
 	}
 
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
@@ -1701,14 +1702,14 @@ func (s *Smart) commitUnwrap(metadata *C.Metadata, asnNumber, oldProxy, proxyNam
 		if !force && oldProxy == "" {
 			force = true
 		}
-		if oldProxy != "" && proxyName != oldProxy {
-			s.closeSameConnection(metadata, proxyName, metadata.SmartTarget, asnNumber, false, oldProxy)
+		if proxyName != oldProxy {
+			s.closeSameConnection(metadata, proxyName, metadata.SmartTarget, asnNumber, false)
 		}
 		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy}, force)
 	} else {
 		if oldProxy != "" {
 			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
-			s.closeSameConnection(metadata, "", metadata.SmartTarget, asnNumber, false, oldProxy)
+			s.closeSameConnection(metadata, "", metadata.SmartTarget, asnNumber, true)
 		}
 	}
 }
@@ -1717,18 +1718,18 @@ func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegrad
 	wildcardTarget := metadata.WildcardTarget
 	target := metadata.SmartTarget
 
-	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, isDegraded, checked, blockCode)
+	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
 
 	if isDegraded || failedBlock {
 		if target != "" && target != wildcardTarget {
-			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, isDegraded, checked, blockCode)
+			s.store.UpdateHostStatus(s.Name(), s.configName, target, metadata, proxyName, s.maxFailedTimes, s.hostFailLimit, isDegraded, checked, blockCode)
 		}
 	}
 
 	return failedBlock
 }
 
-func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asnNumber string, isDegraded bool, oldProxy string) {
+func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asnNumber string, isDegraded bool) {
 	statistic.DefaultManager.RangeSmartTarget(target, func(id string) bool {
 		if id == metadata.UUID {
 			return true
@@ -1744,12 +1745,9 @@ func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asn
 			tracker.Info().Metadata.SmartBlock = "degraded"
 			_ = tracker.Close()
 		} else if proxyName != "" {
-			// New best node confirmed: close all connections not using it
 			if !lo.Contains(tracker.Chains(), proxyName) {
 				_ = tracker.Close()
 			}
-		} else if oldProxy != "" && lo.Contains(tracker.Chains(), oldProxy) {
-			_ = tracker.Close()
 		}
 		return true
 	})
@@ -1775,7 +1773,7 @@ func (s *Smart) checkHostStatus() {
 			}
 			status, okRes, err := s.StatusTest(p, host)
 			if err == nil && okRes {
-				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, false, true, 0)
+				s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, &C.Metadata{Host: host}, nodeName, s.maxFailedTimes, s.hostFailLimit, false, true, 0)
 				log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] with HTTP Status: [%d]", s.Name(), nodeName, host, status)
 			} else if err == nil {
 				log.Debugln("[Smart] Recover Group: [%s] - Node: [%s] for Host: [%s] still abnormal with HTTP Status: [%d]", s.Name(), nodeName, host, status)
@@ -1815,10 +1813,10 @@ func (s *Smart) getPriorityFactor(proxyName string) float64 {
 }
 
 func (s *Smart) applyMaxFailedTimes() {
-	if proxyCount := len(s.GetProxies(true)); proxyCount > 0 && s.maxFailedTimes >= proxyCount {
-		s.maxFailedTimes = proxyCount - 1
-		if s.maxFailedTimes < 1 {
-			s.maxFailedTimes = 1
+	if proxyCount := len(s.GetProxies(true)); proxyCount > 0 && s.hostFailLimit >= proxyCount {
+		s.hostFailLimit = proxyCount - 1
+		if s.hostFailLimit < 1 {
+			s.hostFailLimit = 1
 		}
 	}
 }

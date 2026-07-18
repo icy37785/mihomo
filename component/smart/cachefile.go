@@ -25,13 +25,34 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 		data []byte
 	}
 
+
+	var deleteKeys []string
+	deleteKeyIdx := make(map[string]int)
+
 	writeIndex := make(map[string]int, len(operations))
 	entries := make([]writeEntry, 0, len(operations))
+
 	for i := range operations {
 		key := formatOperationKey(&operations[i])
 		if key == "" {
 			continue
 		}
+
+		if operations[i].Type == OpDeleteData {
+			deleteKeyIdx[key] = len(deleteKeys)
+			deleteKeys = append(deleteKeys, key)
+			if idx, ok := writeIndex[key]; ok {
+				entries[idx].data = nil
+				delete(writeIndex, key)
+			}
+			continue
+		}
+
+		if didx, ok := deleteKeyIdx[key]; ok {
+			deleteKeys[didx] = ""
+			delete(deleteKeyIdx, key)
+		}
+
 		if idx, ok := writeIndex[key]; ok {
 			entries[idx].data = operations[i].Data
 			continue
@@ -39,7 +60,26 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 		writeIndex[key] = len(entries)
 		entries = append(entries, writeEntry{key: key, data: operations[i].Data})
 	}
-	if len(entries) == 0 {
+
+	n := 0
+	for _, e := range entries {
+		if e.data != nil {
+			entries[n] = e
+			n++
+		}
+	}
+	entries = entries[:n]
+
+	m := 0
+	for _, k := range deleteKeys {
+		if k != "" {
+			deleteKeys[m] = k
+			m++
+		}
+	}
+	deleteKeys = deleteKeys[:m]
+
+	if len(entries) == 0 && len(deleteKeys) == 0 {
 		return nil
 	}
 
@@ -50,6 +90,12 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 			var err error
 			bucket, err = tx.CreateBucketIfNotExists(bucketSmartStats)
 			if err != nil {
+				return err
+			}
+		}
+
+		for _, key := range deleteKeys {
+			if err := bucket.Delete([]byte(key)); err != nil {
 				return err
 			}
 		}
@@ -154,6 +200,14 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 			continue
 		}
 		if depth >= 4 && op.Group != group {
+			continue
+		}
+
+		if op.Type == OpDeleteData {
+			deleteKey := formatOperationKey(&op)
+			if deleteKey != "" {
+				delete(result, deleteKey)
+			}
 			continue
 		}
 

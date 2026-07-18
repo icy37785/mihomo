@@ -23,6 +23,7 @@ const (
 	OpSavePrefetch
 	OpSaveRanking
 	OpSaveHostFailures
+	OpDeleteData
 )
 
 const (
@@ -109,12 +110,13 @@ type (
 	Store struct {}
 
 	StoreOperation struct {
-		Type   int
-		Group  string
-		Config string
-		Target string
-		Node   string
-		Data   []byte
+		Type    int
+		KeyType string // used by OpDeleteData to identify the target key type
+		Group   string
+		Config  string
+		Target  string
+		Node    string
+		Data    []byte
 	}
 )
 
@@ -157,6 +159,29 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
 	case OpSaveHostFailures:
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+	case OpDeleteData:
+		kt := op.KeyType
+		if kt == "" {
+			if op.Target != "" {
+				kt = KeyTypeHostFailures
+			} else if op.Node != "" {
+				kt = KeyTypeNode
+			} else {
+				kt = KeyTypeRanking
+			}
+		}
+		switch kt {
+		case KeyTypeNode:
+			return FormatDBKey(KeyTypeNode, op.Config, op.Group, op.Node)
+		case KeyTypeStats:
+			return FormatDBKey(KeyTypeStats, op.Config, op.Group, op.Target, op.Node)
+		case KeyTypePrefetch:
+			return FormatDBKey(KeyTypePrefetch, op.Config, op.Group, op.Target)
+		case KeyTypeRanking:
+			return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
+		default:
+			return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+		}
 	default:
 		return ""
 	}

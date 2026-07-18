@@ -1266,7 +1266,7 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets
 	return
 }
 
-func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, failure, checked bool, statusCode int64) bool {
+func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata *C.Metadata, name string, maxFailedTimes int, hostFailLimit int, failure, checked bool, statusCode int64) bool {
 	if !checked {
 		return false
 	}
@@ -1449,7 +1449,7 @@ saveAndReturn:
 			hostBlockingCount += len(cs.Nodes)
 		}
 	}
-	if hostBlockingCount > maxFailedTimes {
+	if hostBlockingCount > hostFailLimit {
 		hs.Blocked = true
 		failedBlock = false
 	} else {
@@ -1462,18 +1462,28 @@ saveAndReturn:
 		}
 	}
 
-	data, err := json.Marshal(hs)
-	if err != nil {
-		return failedBlock
-	}
+	if len(hs.Codes) > 0 {
+		data, err := json.Marshal(hs)
+		if err != nil {
+			return failedBlock
+		}
 
-	s.AppendToGlobalQueue(StoreOperation{
-		Type:   OpSaveHostFailures,
-		Group:  group,
-		Config: config,
-		Target: wildcardTarget,
-		Data:   data,
-	})
+		s.AppendToGlobalQueue(StoreOperation{
+			Type:   OpSaveHostFailures,
+			Group:  group,
+			Config: config,
+			Target: wildcardTarget,
+			Data:   data,
+		})
+	} else {
+		s.AppendToGlobalQueue(StoreOperation{
+			Type:    OpDeleteData,
+			KeyType: KeyTypeHostFailures,
+			Group:   group,
+			Config:  config,
+			Target:  wildcardTarget,
+		})
+	}
 
 	return failedBlock
 }
