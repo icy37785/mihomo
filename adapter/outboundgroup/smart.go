@@ -713,24 +713,49 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		}
 	}
 
+	// 预解析缓存或实时计算
+	computeFreshNodes := func(isUDP bool) ([]string, []float64) {
+		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
+			return proxiesName, weights
+		}
+		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+			return proxiesName, weights
+		}
+		return nil, nil
+	}
+
+	// 异步更新过期缓存（stale-while-revalidate）
+	refreshUnwrapCache := func(isUDP bool) {
+		names, _ := computeFreshNodes(isUDP)
+		if len(names) == 0 {
+			return
+		}
+		allProxies := s.GetProxies(true)
+		proxyByName := make(map[string]C.Proxy, len(allProxies))
+		for _, p := range allProxies {
+			proxyByName[p.Name()] = p
+		}
+		resultProxies := make([]C.Proxy, 0, len(names))
+		for _, name := range names {
+			if p, ok := proxyByName[name]; ok {
+				resultProxies = append(resultProxies, p)
+			}
+		}
+		if len(resultProxies) > 0 {
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies, true)
+		}
+	}
+
 	trySelector := func(isUDP bool) ([]string, []float64, string, bool) {
 		// 检查匹配缓存
-		proxiesName, oldProxy, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
-		if len(proxiesName) > 0 {
+		if proxiesName, oldProxy, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
+			if expired {
+				go refreshUnwrapCache(isUDP)
+			}
 			return proxiesName, nil, oldProxy, expired
 		}
-
-		// 检查预解析缓存
-		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
-			return proxiesName, weights, oldProxy, expired
-		}
-
-		// 实时计算最佳节点
-		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
-			return proxiesName, weights, oldProxy, expired
-		}
-
-		return nil, nil, oldProxy, expired
+		proxiesName, weights := computeFreshNodes(isUDP)
+		return proxiesName, weights, "", false
 	}
 
 	isUDP := metadata.NetWork == C.UDP

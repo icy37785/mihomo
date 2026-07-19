@@ -228,7 +228,7 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 // When force is true, the value is set unconditionally (used when commitUnwrap
 // has already determined the cache is stale and needs replacement).
 // When force is false, first-writer-wins semantics apply: an existing non-empty
-// non-expired entry is preserved (used during cold start).
+// entry is preserved (used during cold start).
 func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string, proxies []C.Proxy, force bool) {
 	if target == "" || len(proxies) == 0 {
 		return
@@ -241,31 +241,23 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 
 	// SmartTarget (same ruleset = same node)
 	targetKey := FormatDBKey(config, group, target)
-	if force {
-		unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
-	} else {
-		if value, found := unwrapCache.GetOrStore(targetKey, func() UnwrapMap {
+	store := func(key string) {
+		if force {
+			unwrapCache.Set(key, UnwrapMap{Proxies: names})
+			return
+		}
+		if value, found := unwrapCache.GetOrStore(key, func() UnwrapMap {
 			return UnwrapMap{Proxies: names}
-		}); found {
-			value.Proxies = names
-			unwrapCache.Set(targetKey, value)
+		}); found && len(value.Proxies) == 0 {
+			unwrapCache.Set(key, UnwrapMap{Proxies: names})
 		}
 	}
+	store(targetKey)
 
 	// ASN sharing (CDN excluded)
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
-		if force {
-			unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
-		} else {
-			if value, found := unwrapCache.GetOrStore(asnKey, func() UnwrapMap {
-				return UnwrapMap{Proxies: names}
-			}); found {
-				if len(value.Proxies) == 0 {
-					unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
-				}
-			}
-		}
+		store(asnKey)
 	}
 }
 
