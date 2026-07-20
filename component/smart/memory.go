@@ -224,12 +224,7 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 	return nil, nil
 }
 
-// StoreUnwrapResult stores the unwrap result for a target.
-// When force is true, the value is set unconditionally (used when commitUnwrap
-// has already determined the cache is stale and needs replacement).
-// When force is false, first-writer-wins semantics apply: an existing non-empty
-// entry is preserved (used during cold start).
-func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string, proxies []C.Proxy, force bool) {
+func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string, proxies []C.Proxy) {
 	if target == "" || len(proxies) == 0 {
 		return
 	}
@@ -241,51 +236,40 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 
 	// SmartTarget (same ruleset = same node)
 	targetKey := FormatDBKey(config, group, target)
-	store := func(key string) {
-		if force {
-			unwrapCache.Set(key, UnwrapMap{Proxies: names})
-			return
-		}
-		if value, found := unwrapCache.GetOrStore(key, func() UnwrapMap {
-			return UnwrapMap{Proxies: names}
-		}); found && len(value.Proxies) == 0 {
-			unwrapCache.Set(key, UnwrapMap{Proxies: names})
-		}
-	}
-	store(targetKey)
+	unwrapCache.Set(targetKey, UnwrapMap{Proxies: names})
 
-	// ASN sharing (CDN excluded)
+	// ASN sharing (CDN excluded): first-writer-wins
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
-		store(asnKey)
+		if existing, _, found := unwrapCache.GetWithExpire(asnKey); !found || len(existing.Proxies) == 0 {
+			unwrapCache.Set(asnKey, UnwrapMap{Proxies: names})
+		}
 	}
 }
 
-func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, oldProxy string, expired bool) {
+func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, wildcardTarget string) (proxies []string, expired bool) {
 	if target == "" {
-		return nil, "", false
+		return nil, false
 	}
 
 	targetKey := FormatDBKey(config, group, target)
 	if value, expireTime, found := unwrapCache.GetWithExpire(targetKey); found {
-		targetExpired := expireTime.Before(time.Now())
 		if len(value.Proxies) > 0 {
-			return value.Proxies, value.Proxies[0], targetExpired
+			return value.Proxies, expireTime.Before(time.Now())
 		}
 	}
 
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, expireTime, found := unwrapCache.GetWithExpire(asnKey); found {
-			targetExpired := expireTime.Before(time.Now())
 			if len(value.Proxies) > 0 {
 				unwrapCache.Set(targetKey, UnwrapMap{Proxies: value.Proxies})
-				return value.Proxies, value.Proxies[0], targetExpired
+				return value.Proxies, expireTime.Before(time.Now())
 			}
 		}
 	}
 
-	return nil, "", false
+	return nil, false
 }
 
 func (s *Store) DeleteUnwrapResult(group, config string, target string, asnNumber string, wildcardTarget string) {

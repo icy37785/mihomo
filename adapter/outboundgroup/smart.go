@@ -66,6 +66,7 @@ type SmartOption struct {
 	CollectData    bool    `group:"collectdata,omitempty"`
 	SampleRate     float64 `group:"sample-rate,omitempty"`
 	PreferASN      bool    `group:"prefer-asn,omitempty"`
+	Tolerance      uint16  `group:"tolerance,omitempty"`
 }
 
 type Smart struct {
@@ -91,6 +92,7 @@ type Smart struct {
 	collectData            bool
 	preferASN              bool
 	hostFailLimit          int
+	tolerance              uint16
 }
 
 type dialResult struct {
@@ -149,6 +151,7 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		useLightGBM:          smartOption.UseLightGBM,
 		collectData:          smartOption.CollectData,
 		preferASN:            smartOption.PreferASN,
+		tolerance:            smartOption.Tolerance,
 	}
 
 	s.hostFailLimit = s.maxFailedTimes
@@ -285,7 +288,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		return batch, timeout
 	}
 
-	tryDial := func(proxies []C.Proxy, asnNumber string, oldProxy string, expired bool) (C.Conn, error) {
+	tryDial := func(proxies []C.Proxy, asnNumber string) (C.Conn, error) {
 		var finalErr error
 		for i := 0; i < maxRetries; i++ {
 			batch, timeout := getBatch(proxies, i)
@@ -304,27 +307,26 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 				}
 				finalErr = err
 			} else {
-				s.commitUnwrap(metadata, asnNumber, oldProxy, p.Name(), expired, p)
+				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
+				s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
 
-		if len(proxies) == 1 && oldProxy != "" {
-			s.commitUnwrap(metadata, asnNumber, oldProxy, "", false, nil)
-		}
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
 
 		return nil, finalErr
 	}
 
-	proxies, asnNumber, oldProxy, expired := s.selectProxies(metadata, s.GetProxies(true))
+	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
 
-	return tryDial(proxies, asnNumber, oldProxy, expired)
+	return tryDial(proxies, asnNumber)
 }
 
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	var finalErr error
 
-	proxies, asnNumber, oldProxy, expired := s.selectProxies(metadata, s.GetProxies(true))
+	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
 
 	limit := len(proxies)
 	if limit > maxSelected {
@@ -364,15 +366,17 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 				continue
 			}
 
-			s.commitUnwrap(metadata, asnNumber, oldProxy, proxy.Name(), expired, proxy)
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
+			s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
 			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
 		}
 
-		if singleProxyRetry && oldProxy != "" {
-			s.commitUnwrap(metadata, asnNumber, oldProxy, "", false, nil)
+		if singleProxyRetry {
 			break
 		}
 	}
+
+	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
 
 	return nil, finalErr
 }
@@ -392,12 +396,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
-	proxies, asnNumber, oldProxy, _ := s.selectProxies(metadata, proxies)
-
-	// Seed the unwrap cache on cold start so concurrent lookups see the same node.
-	if oldProxy == "" {
-		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, proxies[0:1], false)
-	}
+	proxies, _ = s.selectProxies(metadata, proxies)
 
 	return proxies[0]
 }
@@ -517,6 +516,7 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"collectData":     s.collectData,
 		"sampleRate":      s.sampleRate,
 		"preferASN":       s.preferASN,
+		"tolerance":       s.tolerance,
 	})
 }
 
@@ -610,6 +610,18 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			if hasPriority && ki.factor != kj.factor {
 				return ki.factor > kj.factor
 			}
+			// Tolerance: delays within tolerance are treated as equal, preventing jitter
+			if s.tolerance > 0 {
+				var diff uint16
+				if ki.delay > kj.delay {
+					diff = ki.delay - kj.delay
+				} else {
+					diff = kj.delay - ki.delay
+				}
+				if diff <= s.tolerance {
+					return ki.index < kj.index
+				}
+			}
 			if ki.delay != kj.delay {
 				return ki.delay < kj.delay
 			}
@@ -696,7 +708,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 }
 
 // 节点选择
-func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, string, string, bool) {
+func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Proxy, string) {
 	// 添加ASN信息
 	asnNumber := s.getASNCode(metadata)
 	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
@@ -708,7 +720,7 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
-				return []C.Proxy{p}, asnNumber, "", false
+				return []C.Proxy{p}, asnNumber
 			}
 		}
 	}
@@ -742,49 +754,26 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 			}
 		}
 		if len(resultProxies) > 0 {
-			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies, true)
+			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, resultProxies)
 		}
 	}
 
-	trySelector := func(isUDP bool) ([]string, []float64, string, bool) {
+	trySelector := func(isUDP bool) ([]string, []float64) {
 		// 检查匹配缓存
-		if proxiesName, oldProxy, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
+		if proxiesName, expired := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(proxiesName) > 0 {
 			if expired {
 				go refreshUnwrapCache(isUDP)
 			}
-			return proxiesName, nil, oldProxy, expired
+			return proxiesName, nil
 		}
-		proxiesName, weights := computeFreshNodes(isUDP)
-		return proxiesName, weights, "", false
+		return computeFreshNodes(isUDP)
 	}
 
 	isUDP := metadata.NetWork == C.UDP
-	resultNames, resultWeights, oldProxy, expired := trySelector(isUDP)
+	resultNames, resultWeights := trySelector(isUDP)
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
 
-	if len(result) > 0 {
-		if cachedNames, _, _ := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget); len(cachedNames) > 0 && cachedNames[0] != result[0].Name() {
-			byName := make(map[string]C.Proxy, len(result))
-			for _, p := range result {
-				byName[p.Name()] = p
-			}
-			if cached, ok := byName[cachedNames[0]]; ok {
-				recheckBlocked := s.store.GetBlockedNodes(s.Name(), s.configName)
-				recheckFailNodes, _, _, recheckWtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, metadata.SmartTarget)
-				recheckInFail := recheckFailNodes[cachedNames[0]]
-				cachedValid := !recheckBlocked[cachedNames[0]] && (recheckWtBlocked || !recheckInFail) && cached.AliveForTestUrl(s.testUrl)
-				if cachedValid {
-					result = []C.Proxy{cached}
-				} else {
-					s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, result[0:1], true)
-				}
-			} else {
-				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, result[0:1], true)
-			}
-		}
-	}
-
-	return result, asnNumber, oldProxy, expired
+	return result, asnNumber
 }
 
 func (s *Smart) InitSmart() {
@@ -1715,28 +1704,6 @@ func (s *Smart) checkNodeQuality(
 	}
 
 	return newWeight, false, false, 0
-}
-
-// commitUnwrap ensures node selection consistency across concurrent connections
-// to the same target by finalizing the unwrap cache after a connection attempt.
-// proxy != nil: stores result; force-overwrites if cache is stale (expired or filtered-out).
-// proxy == nil: all retries failed, force-clears cache and closes old connections.
-func (s *Smart) commitUnwrap(metadata *C.Metadata, asnNumber, oldProxy, proxyName string, expired bool, proxy C.Proxy) {
-	if proxy != nil {
-		force := oldProxy != "" && (expired || proxyName != oldProxy)
-		if !force && oldProxy == "" {
-			force = true
-		}
-		if proxyName != oldProxy {
-			s.closeSameConnection(metadata, proxyName, metadata.SmartTarget, asnNumber, false)
-		}
-		s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy}, force)
-	} else {
-		if oldProxy != "" {
-			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
-			s.closeSameConnection(metadata, "", metadata.SmartTarget, asnNumber, true)
-		}
-	}
 }
 
 func (s *Smart) markNodeFailure(metadata *C.Metadata, proxyName string, isDegraded bool, checked bool, blockCode int64) bool {

@@ -1463,7 +1463,7 @@ saveAndReturn:
 	}
 
 	if len(hs.Codes) > 0 {
-		data, err := json.Marshal(hs)
+		data, err := json.Marshal(&hs)
 		if err != nil {
 			return failedBlock
 		}
@@ -1749,7 +1749,7 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 				if len(hs.Codes) == 0 {
 					failuresToDelete = append(failuresToDelete, path)
 				} else {
-					newData, merr := json.Marshal(hs)
+					newData, merr := json.Marshal(&hs)
 					if merr != nil {
 						if firstErr == nil {
 							firstErr = merr
