@@ -1644,14 +1644,16 @@ func (s *Smart) checkNodeQuality(
 
 	now := time.Now().Unix()
 
-	// 用户手动/智能屏蔽
-	if metadata.SmartBlock == "blocked" || metadata.SmartBlock == "degraded" {
-		if metadata.SmartBlock == "degraded" {
-			return oldWeight, false, false, 0
-		}
+	// 用户手动屏蔽
+	if metadata.SmartBlock == "blocked" {
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected manual block...",
 			s.Name(), proxyName, networkType, addressDisplay)
 		return newWeight, true, true, 1
+	}
+
+	// 强制关闭的连接，跳过质量检查避免误降级
+	if metadata.SmartBlock == "degraded" {
+		return oldWeight, false, false, 0
 	}
 
 	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
@@ -1660,7 +1662,7 @@ func (s *Smart) checkNodeQuality(
 		return newWeight, false, false, 0
 	}
 
-	if newWeight < smart.AllowedWeight {
+	if newWeight > 0 && newWeight < smart.AllowedWeight {
 		return newWeight, true, true, 5
 	}
 
@@ -1676,7 +1678,7 @@ func (s *Smart) checkNodeQuality(
 	}
 
 	// 异常状态码检测
-	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP {
+	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP && metadata.Type != C.INNER {
 		var failure bool
 		var checked bool
 		if now - wtLastCheck > 300 || now - wtLastFailure < 300 {

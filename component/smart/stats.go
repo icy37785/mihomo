@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	shardedLocks     [1024]*sync.RWMutex
+	shardedLocks     [1024]*sync.Mutex
 	shardedLocksOnce sync.Once
 )
 
@@ -104,12 +104,12 @@ type targetMinHeap []ActiveTarget
 func initShardedLocks() {
 	shardedLocksOnce.Do(func() {
 		for i := range shardedLocks {
-			shardedLocks[i] = &sync.RWMutex{}
+			shardedLocks[i] = &sync.Mutex{}
 		}
 	})
 }
 
-func GetTargetNodeLock(target, group, proxy string) *sync.RWMutex {
+func GetTargetNodeLock(target, group, proxy string) *sync.Mutex {
 	initShardedLocks()
 
 	const fnvOffset32 uint32 = 2166136261
