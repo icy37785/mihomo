@@ -54,9 +54,7 @@ func (w *closeCallbackPacketConn) Close() error {
 }
 
 func (w *closeCallbackPacketConn) CloseWrite() error {
-	go w.closeOnce.Do(func() {
-		w.closeFunc()
-	})
+	w.closeOnce.Do(w.closeFunc)
 	if wc, ok := w.PacketConn.(network.WriteCloser); ok {
 		return wc.CloseWrite()
 	}

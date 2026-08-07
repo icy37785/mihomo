@@ -184,3 +184,17 @@ func TestTotalRetrans_ZeroRetransWithSegs(t *testing.T) {
 		t.Errorf("expected 0 when RetransSegs==0 and SegsOut>0, got %d", got)
 	}
 }
+
+func TestLossRate_CappedAtOne(t *testing.T) {
+	s := &Stats{SegsOut: 1, RetransSegs: 5}
+	if rate := s.LossRate(); rate != 1 {
+		t.Errorf("expected LossRate capped at 1, got %.4f", rate)
+	}
+}
+
+func TestLossRate_CappedAtOne_BytesBased(t *testing.T) {
+	s := &Stats{BytesSent: 100, BytesRetrans: 300, SegsOut: 0, RetransSegs: 0}
+	if rate := s.LossRate(); rate != 1 {
+		t.Errorf("expected LossRate capped at 1, got %.4f", rate)
+	}
+}

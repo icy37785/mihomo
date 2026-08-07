@@ -13,13 +13,18 @@ func (s *Stats) LossRate() float64 {
 	if s == nil {
 		return 0
 	}
+	var rate float64
 	if s.SegsOut > 0 {
-		return float64(s.RetransSegs) / float64(s.SegsOut)
+		rate = float64(s.RetransSegs) / float64(s.SegsOut)
+	} else if s.BytesSent > 0 {
+		rate = float64(s.BytesRetrans) / float64(s.BytesSent)
+	} else {
+		return 0
 	}
-	if s.BytesSent > 0 {
-		return float64(s.BytesRetrans) / float64(s.BytesSent)
+	if rate > 1 {
+		return 1
 	}
-	return 0
+	return rate
 }
 
 func (s *Stats) TotalSent() uint64 {

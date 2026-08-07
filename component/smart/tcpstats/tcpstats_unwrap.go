@@ -32,7 +32,7 @@ outer:
 				conn = next
 				continue outer
 			}
-			return nil
+			// fall through to other unwrap methods
 		}
 		if nc, ok := conn.(interface{ NetConn() net.Conn }); ok {
 			conn = nc.NetConn()
@@ -46,15 +46,13 @@ outer:
 			if v.Kind() == reflect.Struct {
 				t := v.Type()
 				for i := 0; i < v.NumField(); i++ {
-					if !t.Field(i).IsExported() {
+					f := v.Field(i)
+					if !t.Field(i).IsExported() || !f.CanInterface() {
 						continue
 					}
-					f := v.Field(i)
-					if f.Kind() == reflect.Interface {
-						if inner, ok := f.Interface().(net.Conn); ok {
-							conn = inner
-							continue outer
-						}
+					if inner, ok := f.Interface().(net.Conn); ok {
+						conn = inner
+						continue outer
 					}
 				}
 			}

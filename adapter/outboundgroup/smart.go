@@ -1493,6 +1493,9 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if sent := atomicRecord.Get("cumulSent").(int64); sent > 0 {
 		cumulLossRate = float64(atomicRecord.Get("cumulRetrans").(int64)) / float64(sent)
+		if cumulLossRate > 1 {
+			cumulLossRate = 1
+		}
 	}
 
 	emaLossRate := atomicRecord.Get("lossRate").(float64)

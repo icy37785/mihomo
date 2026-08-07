@@ -3,8 +3,10 @@ package geodata
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 
@@ -54,58 +56,39 @@ func SetSiteMatcher(newMatcher string) {
 	}
 }
 
-func verifyGeodataReader(r io.Reader, fileSize int64) error {
-	if fileSize == 0 {
-		return fmt.Errorf("invalid geodata file: empty file")
-	}
-
+func verifyGeodata(r io.Reader) error {
 	br := bufio.NewReader(r)
-	var pos int64
-	var b [1]byte
-
-	for pos < fileSize {
-		// Each top-level entry starts with 0x0A (protobuf field 1, wire type 2).
-		if _, err := io.ReadFull(br, b[:]); err != nil {
+	first := true
+	for {
+		tag, err := br.ReadByte()
+		if err == io.EOF {
+			if first {
+				return fmt.Errorf("invalid geodata file: empty file")
+			}
+			return nil
+		}
+		if err != nil {
 			return fmt.Errorf("invalid geodata file: %w", err)
 		}
-		pos++
-		if b[0] != 0x0A {
-			return fmt.Errorf("invalid geodata file: unexpected byte 0x%02X at offset %d", b[0], pos-1)
+		first = false
+		if tag != 0x0A {
+			return fmt.Errorf("invalid geodata file: unexpected byte 0x%02X", tag)
 		}
 
-		// Decode the entry length varint.
-		var entryLen uint64
-		var shift uint
-		for {
-			if _, err := io.ReadFull(br, b[:]); err != nil {
-				return fmt.Errorf("invalid geodata file: truncated varint at offset %d: %w", pos, err)
-			}
-			pos++
-			entryLen |= uint64(b[0]&0x7F) << shift
-			if b[0] < 0x80 {
-				break
-			}
-			shift += 7
-			if shift >= 64 {
-				return fmt.Errorf("invalid geodata file: varint overflow at offset %d", pos)
-			}
+		entryLen, err := binary.ReadUvarint(br)
+		if err != nil {
+			return fmt.Errorf("invalid geodata file: truncated varint: %w", err)
 		}
-
 		if entryLen == 0 {
-			return fmt.Errorf("invalid geodata file: zero-length entry at offset %d", pos)
+			return fmt.Errorf("invalid geodata file: zero-length entry")
 		}
-
+		if entryLen > math.MaxInt64 {
+			return fmt.Errorf("invalid geodata file: entry length overflow")
+		}
 		if _, err := io.CopyN(io.Discard, br, int64(entryLen)); err != nil {
-			return fmt.Errorf("invalid geodata file: truncated entry at offset %d: %w", pos, err)
+			return fmt.Errorf("invalid geodata file: truncated entry: %w", err)
 		}
-		pos += int64(entryLen)
 	}
-
-	if pos != fileSize {
-		return fmt.Errorf("invalid geodata file: truncated (last entry ends at %d, file size %d)", pos, fileSize)
-	}
-
-	return nil
 }
 
 func verifyGeodataFile(path string) error {
@@ -114,16 +97,11 @@ func verifyGeodataFile(path string) error {
 		return err
 	}
 	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	return verifyGeodataReader(f, info.Size())
+	return verifyGeodata(f)
 }
 
 func VerifyGeodataBytes(data []byte) error {
-	return verifyGeodataReader(bytes.NewReader(data), int64(len(data)))
+	return verifyGeodata(bytes.NewReader(data))
 }
 
 func Verify(name string) error {
