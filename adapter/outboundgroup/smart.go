@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -560,7 +561,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		}
 	}
 
-	checkNodeUsed := make(map[string]bool, len(names)+len(wtFailNodes))
+	checkNodeUsed := make(map[string]bool, len(names))
 
 	selected := make([]C.Proxy, 0, minCount+1)
 	var failedSelected []C.Proxy
@@ -579,22 +580,12 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			continue
 		}
 		if wtFailNodes[name] != 0 {
-			failedSelected = append(failedSelected, proxy)
+			if wtBlocked {
+				failedSelected = append(failedSelected, proxy)
+			}
 		} else {
 			selected = append(selected, proxy)
 		}
-	}
-
-	if wtBlocked {
-		for _, p := range failedSelected {
-			if wtFailNodes[p.Name()] != 1 {
-				selected = append(selected, p)
-			}
-		}
-	}
-
-	for name := range wtFailNodes {
-		checkNodeUsed[name] = true
 	}
 
 	// Unwrap result should not filled
@@ -658,7 +649,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	for _, p := range all {
 		name := p.Name()
-		if checkNodeUsed[name] {
+		if checkNodeUsed[name] || wtFailNodes[name] != 0 {
 			continue
 		}
 		if blockedNodes[name] {
@@ -707,14 +698,36 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		}
 	}
 
-	if len(selected) == 0 {
-		fallbackAll := defaultSort(all)
-		for _, p := range fallbackAll {
-			if p.AliveForTestUrl(s.testUrl) {
+	if wtBlocked && len(selected) < minCount {
+		for _, p := range failedSelected {
+			if wtFailNodes[p.Name()] != 1 {
 				selected = append(selected, p)
 			}
 			if len(selected) >= minCount {
 				break
+			}
+		}
+	}
+
+	if len(selected) == 0 {
+		fallbackAll := defaultSort(slices.Clone(all))
+		for _, p := range fallbackAll {
+			if wtFailNodes[p.Name()] == 0 && p.AliveForTestUrl(s.testUrl) && (!isUDP || p.SupportUDP()) {
+				selected = append(selected, p)
+			}
+			if len(selected) >= minCount {
+				break
+			}
+		}
+
+		if len(selected) == 0 {
+			for _, p := range fallbackAll {
+				if p.AliveForTestUrl(s.testUrl) {
+					selected = append(selected, p)
+				}
+				if len(selected) >= minCount {
+					break
+				}
 			}
 		}
 
@@ -1681,7 +1694,7 @@ func (s *Smart) checkNodeQuality(
 		return oldWeight, false, false, 0
 	}
 
-	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
+	wtFailNodes, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
 
 	if wtBlocked {
 		return newWeight, false, false, 0
@@ -1693,6 +1706,10 @@ func (s *Smart) checkNodeQuality(
 
 	if err != nil {
 		return newWeight, false, true, 3
+	}
+
+	if wtFailNodes[proxyName] != 0 {
+		return newWeight, false, false, 0
 	}
 
 	// 零流量连接
