@@ -3,8 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag version to release"
-        required: true
+        description: "Release tag (vX.Y.Z); leave empty to update Prerelease-Alpha"
+        required: false
+        type: string
   push:
     paths-ignore:
       - "docs/**"
@@ -22,8 +23,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -192,17 +192,31 @@ jobs:
       run: go env
 
     - name: Set variables
+      env:
+        RELEASE_VERSION: ${{ inputs.version }}
       run: |
-        VERSION="${GITHUB_REF_NAME,,}-smart-$(git rev-parse --short HEAD)"
+        set -euo pipefail
+        VERSION="$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]')-smart-$(git rev-parse --short HEAD)"
         VERSION="${VERSION//\//-}"
-        LatestTag="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)"
-        if [ -z "${LatestTag}" ]; then
-          LatestTag="v0.0.0"
+        if [ "$GITHUB_REF_TYPE" = tag ] && [ -z "$RELEASE_VERSION" ]; then
+          RELEASE_VERSION="$GITHUB_REF_NAME"
         fi
-        PackageVersion="$(echo "${LatestTag}" | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
-        if [ -n "${{ github.event.inputs.version }}" ]; then
-          VERSION="${{ github.event.inputs.version }}"
+        if [ -n "$RELEASE_VERSION" ]; then
+          [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo "Invalid release tag: $RELEASE_VERSION" >&2; exit 1; }
+          TAG_REFS="$(git ls-remote --tags origin "refs/tags/$RELEASE_VERSION" "refs/tags/$RELEASE_VERSION^{}")"
+          TAG_COMMIT="$(printf '%s\n' "$TAG_REFS" | sort -k2 | tail -n1 | cut -f1)"
+          if [ -n "$TAG_COMMIT" ] && [ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ]; then
+            echo "Release tag $RELEASE_VERSION points to a different source commit" >&2
+            exit 1
+          fi
+          VERSION="$RELEASE_VERSION"
           PackageVersion="${VERSION#v}"
+        else
+          LatestTag="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)"
+          if [ -z "${LatestTag}" ]; then
+            LatestTag="v0.0.0"
+          fi
+          PackageVersion="$(echo "${LatestTag}" | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
         fi
         {
           echo "VERSION=${VERSION}"
@@ -340,8 +354,9 @@ jobs:
           checksums.txt
 
   Upload-Prerelease:
-    permissions: write-all
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
+    permissions:
+      contents: write
+    if: ${{ github.ref == 'refs/heads/Alpha' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.version == '')) }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -383,6 +398,7 @@ jobs:
 
         Release created at  ${{ env.BUILDTIME }}
         Synchronize ${{ github.ref_name }} branch code updates, keeping only the latest version
+        Source commit: ${{ github.sha }}
         <br>
         [我应该下载哪个文件? / Which file should I download?](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
         [二进制文件筛选 / Binary file selector](https://metacubex.github.io/Meta-Docs/startup/#_1)
@@ -400,72 +416,43 @@ jobs:
         name: "Mihomo ${{ github.ref_name }} with Smart Group"
         files: |
           bin/*
+        fail_on_unmatched_files: true
         prerelease: true
         generate_release_notes: true
         body_path: release.txt
 
   Upload-Release:
-    permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    permissions:
+      contents: write
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.version != '') || (github.event_name == 'push' && github.ref_type == 'tag') }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          ref: Meta
-          fetch-depth: '0'
-          fetch-tags: 'true'
-
-      - name: Get tags
-        run: |
-          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
-          git fetch --tags
-          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> "$GITHUB_ENV"
-
-      - name: Force push Alpha branch to Meta
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git fetch origin Alpha:Alpha
-          git push origin Alpha:Meta --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag the commit on Alpha
-        run: |
-          git checkout Alpha
-          git tag "${{ github.event.inputs.version }}"
-          git push origin "${{ github.event.inputs.version }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate release notes
-        run: |
-            cp ./.github/genReleaseNote.sh ./
-            bash ./genReleaseNote.sh -v "${PREVERSION}...${CURRENTVERSION}"
-            rm ./genReleaseNote.sh
-  
       - uses: actions/download-artifact@v8
         with:
           path: bin/
           merge-multiple: true
   
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
+      - name: Calculate checksums
+        run: |
+          cd bin/
+          find . -type f -not -name "checksums.*" -not -name "version.txt" | sort | xargs sha256sum > checksums.txt
   
       - name: Upload Release
         uses: softprops/action-gh-release@v3
         if: ${{ success() }}
         with:
-          tag_name: ${{ github.event.inputs.version }}
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: bin/*
-          body_path: release.md
+          fail_on_unmatched_files: true
+          generate_release_notes: true
 
   Docker:
     if: ${{ !startsWith(github.event_name, 'pull_request') }}
-    permissions: write-all
+    permissions:
+      contents: read
+      packages: write
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -494,7 +481,7 @@ jobs:
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
         id: meta_alpha
         uses: docker/metadata-action@v6
         with:
@@ -529,7 +516,7 @@ jobs:
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
       - name: Build and push Docker image
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
         uses: docker/build-push-action@v7
         with:
           context: .
