@@ -50,20 +50,20 @@ const (
 	flushQueueInterval       = 5 * time.Minute
 	rankingInterval          = 5 * time.Minute
 
-	maxRetries               = 5
-	maxSelected              = 10
+	maxRetries  = 5
+	maxSelected = 10
 
-	deterministicDialPrefix  = 3
-	parallelDials            = 5
-	connectThreshold         = 5.0
+	deterministicDialPrefix = 3
+	parallelDials           = 5
+	connectThreshold        = 5.0
 
-	floodWindow              = 2 * time.Second
-	floodThreshold           = 50
+	floodWindow    = 2 * time.Second
+	floodThreshold = 50
 )
 
 var (
-	flushQueueOnce       atomic.Bool
-	smartInitOnce        sync.Once
+	flushQueueOnce atomic.Bool
+	smartInitOnce  sync.Once
 )
 
 type SmartOption struct {
@@ -77,34 +77,34 @@ type SmartOption struct {
 
 type Smart struct {
 	*GroupBase
-	store                  *smart.Store
+	store *smart.Store
 
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	configName             string
-	selected               string
-	testUrl                string
-	expectedStatus         string
-	disableUDP             bool
+	configName     string
+	selected       string
+	testUrl        string
+	expectedStatus string
+	disableUDP     bool
 
-	dataCollector          *lightgbm.DataCollector
-	weightModel            *lightgbm.WeightModel
-	policyPriority         []priorityRule
-	priorityCache          xsync.Map[string, float64]
-	sampleRate             float64
-	useLightGBM            bool
-	collectData            bool
-	preferASN              bool
-	hostFailLimit          atomic.Int32
-	tolerance              uint16
+	dataCollector  *lightgbm.DataCollector
+	weightModel    *lightgbm.WeightModel
+	policyPriority []priorityRule
+	priorityCache  xsync.Map[string, float64]
+	sampleRate     float64
+	useLightGBM    bool
+	collectData    bool
+	preferASN      bool
+	hostFailLimit  atomic.Int32
+	tolerance      uint16
 
-	freshNodesGroup        singleflight.Group[nodeResult]
+	freshNodesGroup singleflight.Group[nodeResult]
 
-	suppressStats          atomic.Bool
-	suppressCount          atomic.Int64
-	suppressLast           atomic.Int64
+	suppressStats atomic.Bool
+	suppressCount atomic.Int64
+	suppressLast  atomic.Int64
 }
 
 type dialResult struct {
@@ -147,28 +147,28 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 
 	s := &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:            option.Name,
-			Type:            C.Smart,
-			Hidden:          option.Hidden,
-			Icon:            option.Icon,
-			Filter:          option.Filter,
-			ExcludeFilter:   option.ExcludeFilter,
-			ExcludeType:     option.ExcludeType,
-			TestTimeout:     option.TestTimeout,
-			MaxFailedTimes:  option.MaxFailedTimes,
-			EmptyFallback:   emptyFallback,
-			Providers:       providers,
+			Name:           option.Name,
+			Type:           C.Smart,
+			Hidden:         option.Hidden,
+			Icon:           option.Icon,
+			Filter:         option.Filter,
+			ExcludeFilter:  option.ExcludeFilter,
+			ExcludeType:    option.ExcludeType,
+			TestTimeout:    option.TestTimeout,
+			MaxFailedTimes: option.MaxFailedTimes,
+			EmptyFallback:  emptyFallback,
+			Providers:      providers,
 		}),
-		testUrl:              option.URL,
-		expectedStatus:       option.ExpectedStatus,
-		configName:           configName,
-		disableUDP:           option.DisableUDP,
-		policyPriority:       make([]priorityRule, 0),
-		sampleRate:           1,
-		useLightGBM:          smartOption.UseLightGBM,
-		collectData:          smartOption.CollectData,
-		preferASN:            smartOption.PreferASN,
-		tolerance:            smartOption.Tolerance,
+		testUrl:        option.URL,
+		expectedStatus: option.ExpectedStatus,
+		configName:     configName,
+		disableUDP:     option.DisableUDP,
+		policyPriority: make([]priorityRule, 0),
+		sampleRate:     1,
+		useLightGBM:    smartOption.UseLightGBM,
+		collectData:    smartOption.CollectData,
+		preferASN:      smartOption.PreferASN,
+		tolerance:      smartOption.Tolerance,
 	}
 
 	s.hostFailLimit.Store(int32(s.maxFailedTimes))
@@ -340,7 +340,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		}
 
 		if historyConnectTime > 0 {
-			timeout = time.Duration(float64(historyConnectTime) * connectThreshold) * time.Millisecond
+			timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
 		}
 
 		if timeout > C.DefaultTCPTimeout || timeout <= 0 {
@@ -711,32 +711,10 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	filteredAll = defaultSort(filteredAll)
 
-	canPrepend := weights == nil
-
-	var prependProxy C.Proxy
-	var hasPrepend bool
-
 	for _, p := range filteredAll {
-		if canPrepend && !hasPrepend && (len(selected) < minCount/2 || len(wtFailNodes) <= 0 || wtBlocked) {
-			prependProxy = p
-			hasPrepend = true
-		} else {
-			selected = append(selected, p)
-		}
-		total := len(selected)
-		if hasPrepend {
-			total++
-		}
-		if total >= minCount {
+		selected = append(selected, p)
+		if len(selected) >= minCount {
 			break
-		}
-	}
-	if hasPrepend {
-		selected = append(selected, nil)
-		copy(selected[1:], selected)
-		selected[0] = prependProxy
-		if len(selected) > minCount {
-			selected = selected[:minCount]
 		}
 	}
 
@@ -764,9 +742,21 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 		if len(selected) == 0 {
 			for _, p := range fallbackAll {
+				if wtFailNodes[p.Name()] == 1 {
+					continue
+				}
 				selected = append(selected, p)
 				if len(selected) >= minCount {
 					break
+				}
+			}
+
+			if len(selected) == 0 {
+				for _, p := range fallbackAll {
+					selected = append(selected, p)
+					if len(selected) >= minCount {
+						break
+					}
 				}
 			}
 		}
@@ -963,9 +953,9 @@ func (s *Smart) updateNodeRanking() {
 	if len(rankingWrapper.Result) > 0 {
 		now := time.Now().Unix()
 		lastUpdated := rankingWrapper.LastUpdated
-		cacheAge := time.Duration(now - lastUpdated) * time.Second
+		cacheAge := time.Duration(now-lastUpdated) * time.Second
 
-		if cacheAge < 30 * time.Minute {
+		if cacheAge < 30*time.Minute {
 			rankedNodes := make(map[string]bool, len(rankingWrapper.Result))
 			for _, r := range rankingWrapper.Result {
 				rankedNodes[r.Name] = true
@@ -979,7 +969,7 @@ func (s *Smart) updateNodeRanking() {
 			}
 
 			if !hasUnrankedProxy {
-				if cacheAge <= 10 * time.Minute {
+				if cacheAge <= 10*time.Minute {
 					return
 				}
 				proxyMap := make(map[string]C.Proxy, len(proxies))
@@ -1178,34 +1168,34 @@ func (s *Smart) calcMADMetrics(delays []float64) (currentAnomaly bool, unstable 
 		return true, true, 0, 0
 	}
 
-	if float64(recentSentinels) / float64(recentCount) > SentinelThreshold {
+	if float64(recentSentinels)/float64(recentCount) > SentinelThreshold {
 		unstable = true
 	}
 
 	if m < minSamples {
-		last := delays[n - 1]
+		last := delays[n-1]
 		currentAnomaly = last >= sentinel
 		return currentAnomaly, unstable, 0, 0
 	}
 
 	sort.Float64s(filtered)
 
-	if m % 2 == 1 {
-		median = filtered[m / 2]
+	if m%2 == 1 {
+		median = filtered[m/2]
 	} else {
-		median = (filtered[m / 2 - 1] + filtered[m / 2]) / 2
+		median = (filtered[m/2-1] + filtered[m/2]) / 2
 	}
 
 	devs := make([]float64, 0, m)
 	for _, v := range filtered {
-		devs = append(devs, math.Abs(v - median))
+		devs = append(devs, math.Abs(v-median))
 	}
 	sort.Float64s(devs)
 
-	if m % 2 == 1 {
-		mad = devs[m / 2]
+	if m%2 == 1 {
+		mad = devs[m/2]
 	} else {
-		mad = (devs[m / 2 - 1] + devs[m / 2]) / 2
+		mad = (devs[m/2-1] + devs[m/2]) / 2
 	}
 
 	if mad == 0 {
@@ -1220,12 +1210,12 @@ func (s *Smart) calcMADMetrics(delays []float64) (currentAnomaly bool, unstable 
 			varSum += d * d
 		}
 		std := math.Sqrt(varSum / float64(m))
-		threshold = mean + 2 * std
-		last := delays[n - 1]
+		threshold = mean + 2*std
+		last := delays[n-1]
 		if last >= sentinel {
 			currentAnomaly = true
 		} else {
-			currentAnomaly = last > threshold && delays[n - 2] > threshold
+			currentAnomaly = last > threshold && delays[n-2] > threshold
 		}
 
 		return currentAnomaly, unstable, threshold, calcGrade(threshold)
@@ -1236,7 +1226,7 @@ func (s *Smart) calcMADMetrics(delays []float64) (currentAnomaly bool, unstable 
 		k = smallK
 	}
 
-	threshold = median + k * scale * mad
+	threshold = median + k*scale*mad
 
 	if median > 0 {
 		robustCV = scale * mad / median
@@ -1244,11 +1234,11 @@ func (s *Smart) calcMADMetrics(delays []float64) (currentAnomaly bool, unstable 
 		robustCV = 0
 	}
 
-	last := delays[n - 1]
+	last := delays[n-1]
 	if last >= sentinel {
 		currentAnomaly = true
 	} else {
-		currentAnomaly = last > threshold && delays[n - 2] > threshold
+		currentAnomaly = last > threshold && delays[n-2] > threshold
 	}
 
 	if !unstable {
@@ -1267,7 +1257,7 @@ func (s *Smart) checkNodesStable() {
 	operations := make([]smart.StoreOperation, 0, len(proxies))
 	nodesToBlock := make(map[string]*smart.NodeState, len(proxies))
 	now := time.Now().Unix()
-	blockedUntil := time.Now().Add(checkInterval + 2 * time.Minute).Unix()
+	blockedUntil := time.Now().Add(checkInterval + 2*time.Minute).Unix()
 
 	nodeStateData, _ := s.store.GetNodeStates(s.Name(), s.configName)
 
@@ -1557,7 +1547,12 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	lock := smart.GetTargetNodeLock(target, s.Name(), proxyName)
 	lock.Lock()
-	defer lock.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			lock.Unlock()
+		}
+	}()
 
 	atomicRecord := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, proxyName)
 
@@ -1622,7 +1617,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	input := lightgbm.CreateModelInputFromStatsRecord(
 		atomicRecord, metadata,
-		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration) / 60000.0, wildcardTarget,
+		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration)/60000.0, wildcardTarget,
 		lossRate, cumulLossRate,
 	)
 	input.ConnectionFailed = err != nil
@@ -1644,16 +1639,20 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// block node for the specific domain/IP (wildcardTarget + SmartTarget two-level records)
 	failedBlock := s.markNodeFailure(metadata, proxyName, isDegraded, checked, blockCode)
 
-	if isDegraded || failedBlock {
-		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
-		s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnNumber, metadata.WildcardTarget)
-	}
-
 	// average weight (adapted for target adjusting to rule-based and ASN-based cases)
 	newWeight := updateEMAFloat(oldWeight, adjWeight)
 	atomicRecord.Set("lastUsed", time.Now().Unix())
 	atomicRecord.SetWeight(weightType, newWeight, isUDP)
 	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
+
+	lock.Unlock()
+	locked = false
+
+	if isDegraded || failedBlock {
+		s.closeSameConnection(metadata, proxyName, target, asnNumber, true)
+		s.store.DeleteUnwrapResult(s.Name(), s.configName, target, asnNumber, metadata.WildcardTarget)
+	}
+
 	s.saveStatsRecord(target, proxy, statsSnapshot)
 
 	if s.collectData {
@@ -1671,8 +1670,10 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		s.collectConnectionData(input, metadata, collectedWeight, proxyName, ModelPredicted)
 	}
 
-	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
-		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnNumber, ModelPredicted, lossRate, cumulLossRate)
+	if log.Level() <= log.DEBUG {
+		s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight/priorityFactor, priorityFactor, addressDisplay, proxyName,
+			connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnNumber, ModelPredicted, lossRate, cumulLossRate)
+	}
 }
 
 func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error]) C.Conn {
@@ -1788,7 +1789,7 @@ func (s *Smart) checkNodeQuality(
 	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP && metadata.Type != C.INNER {
 		var failure bool
 		var checked bool
-		if now - wtLastCheck > 300 || now - wtLastFailure < 300 {
+		if now-wtLastCheck > 300 || now-wtLastFailure < 300 {
 			checked = true
 			status, ok, err := s.StatusTest(proxy, metadata.Host)
 			if err == nil {
