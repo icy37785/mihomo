@@ -615,20 +615,24 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, int(s.hostFailLimit.Load()), metadata.SmartTarget)
 
-	var proxyByName map[string]C.Proxy
-	if len(names) > 0 {
-		proxyByName = make(map[string]C.Proxy, len(all))
-		for _, p := range all {
-			proxyByName[p.Name()] = p
-		}
+	checkNodeUsed := make(map[string]bool, len(names))
+	for _, name := range names {
+		checkNodeUsed[name] = true
 	}
 
-	checkNodeUsed := make(map[string]bool, len(names))
+	var proxyByName map[string]C.Proxy
+	if len(names) > 0 {
+		proxyByName = make(map[string]C.Proxy, len(names))
+		for _, p := range all {
+			if name := p.Name(); checkNodeUsed[name] {
+				proxyByName[name] = p
+			}
+		}
+	}
 
 	selected := make([]C.Proxy, 0, minCount+1)
 
 	for i, name := range names {
-		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
 		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
 			continue
@@ -848,9 +852,15 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 			return
 		}
 		allProxies := s.GetProxies(true)
-		proxyByName := make(map[string]C.Proxy, len(allProxies))
+		nameSet := make(map[string]bool, len(names))
+		for _, name := range names {
+			nameSet[name] = true
+		}
+		proxyByName := make(map[string]C.Proxy, len(names))
 		for _, p := range allProxies {
-			proxyByName[p.Name()] = p
+			if name := p.Name(); nameSet[name] {
+				proxyByName[name] = p
+			}
 		}
 		resultProxies := make([]C.Proxy, 0, len(names))
 		for _, name := range names {
@@ -1591,6 +1601,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		if asnNumber != "" && !smart.SharedASNs[asnNumber] {
 			if kind := smart.ClassifyTargetName(target); kind == smart.TargetKindRuleName || kind == smart.TargetKindService {
 				atomicRecord.AddASNEvidence(asnNumber)
+				s.store.RecordASNEvidence(s.Name(), s.configName, target, asnNumber)
 			}
 		}
 	}

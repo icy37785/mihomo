@@ -13,14 +13,25 @@ import (
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
+
+const asnEvidenceRebuildInterval = 30 * time.Minute
+
+var asnEvidenceCache xsync.Map[string, *asnEvidenceEntry]
 
 var (
 	shardedLocks     [1024]*sync.Mutex
 	shardedLocksOnce sync.Once
 )
+
+type asnEvidenceEntry struct {
+	mutex   sync.Mutex
+	updated time.Time
+	data    map[string]map[string]int
+}
 
 type StatsRecord struct {
 	Success            int64              `json:"success"`
@@ -864,9 +875,62 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 	return prefetchCount
 }
 
+// RecordASNEvidence counts one more network observation of a target. It is a no-op
+// until TargetASNEvidence scanned the store once, that scan seeds the counters and
+func (s *Store) RecordASNEvidence(group, config, target, asn string) {
+	if asn == "" || target == "" {
+		return
+	}
+
+	entry, ok := asnEvidenceCache.Load(config + "|" + group)
+	if !ok {
+		return
+	}
+
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
+
+	if entry.data == nil {
+		entry.data = make(map[string]map[string]int)
+	}
+	asns := entry.data[target]
+	if asns == nil {
+		asns = make(map[string]int)
+		entry.data[target] = asns
+	}
+	asns[asn]++
+}
+
 // TargetASNEvidence returns for every target the networks its successful connections
 // were served from and how often, which is the evidence ClaimedASNRules works on.
+// The returned maps are a copy, the counters keep changing in the background.
 func (s *Store) TargetASNEvidence(group, config string) map[string]map[string]int {
+	entry, _ := asnEvidenceCache.LoadOrStore(config+"|"+group, &asnEvidenceEntry{})
+
+	entry.mutex.Lock()
+	defer entry.mutex.Unlock()
+
+	if entry.updated.IsZero() || time.Since(entry.updated) > asnEvidenceRebuildInterval {
+		entry.data = s.scanASNEvidence(group, config)
+		entry.updated = time.Now()
+	}
+
+	if len(entry.data) == 0 {
+		return nil
+	}
+
+	result := make(map[string]map[string]int, len(entry.data))
+	for target, asns := range entry.data {
+		asnsCopy := make(map[string]int, len(asns))
+		for asn, hits := range asns {
+			asnsCopy[asn] = hits
+		}
+		result[target] = asnsCopy
+	}
+	return result
+}
+
+func (s *Store) scanASNEvidence(group, config string) map[string]map[string]int {
 	allStats, err := s.GetAllStats(group, config)
 	if err != nil || len(allStats) == 0 {
 		return nil

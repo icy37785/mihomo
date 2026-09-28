@@ -61,17 +61,10 @@ const (
 	RankRarelyUsed = "RarelyUsed"
 )
 
-// Thresholds for a rule set whose name follows no convention, which is what a user
-// defined provider name looks like. Calibrated on a real setup: collections at
-// 111030 / 27055 / 4367 entries, the largest service catalog at 1792. The ASN limit
-// stays above what a real service spans once shared networks are excluded (github 1,
-// apple and netflix around 2), a promoted service would be split into several exits.
+
 const (
 	BroadRuleCount    = 10000
 	BroadASNDiversity = 6
-
-	// asnEvidencePrefix marks the per target network counters kept in StatsRecord.Weights,
-	// they carry no weight and are claim evidence only
 	asnEvidencePrefix = "asn:"
 
 	ASNClaimMinKinds  = 2   // networks a service must span to claim without repeats
