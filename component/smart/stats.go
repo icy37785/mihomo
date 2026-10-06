@@ -29,6 +29,10 @@ const (
 	hostStatusRetryAfter     = 4 * time.Hour
 	hostStatusViewTTLSeconds = 30
 
+	// zero-traffic and loss need this many strikes within the window
+	hostStrikeWindow = 5 * time.Minute
+	hostStrikeLimit  = 2
+
 	RecordExpiredTime = 7 * 24 * time.Hour
 
 	asnEvidenceRebuildInterval = 30 * time.Minute
@@ -1305,8 +1309,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		}
 		if codeSet.FailCounts != nil {
 			if _, ok := codeSet.FailCounts[name]; ok {
-				if currentCode == -1 || code < currentCode {
-					currentCode = code
+				// a pending strike must not shadow the other codes
+				if code != 4 && code != 6 {
+					if currentCode == -1 || code < currentCode {
+						currentCode = code
+					}
 				}
 			}
 		}
@@ -1326,6 +1333,28 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			}
 		}
 		goto saveAndReturn
+	}
+
+	// the first strike only counts, the second excludes the node
+	if failure && (newCode == 4 || newCode == 6) {
+		count := 1
+		if oldLastFailure != 0 && now-oldLastFailure <= int64(hostStrikeWindow.Seconds()) {
+			if codeSet := hs.Codes[newCode]; codeSet != nil && codeSet.FailCounts != nil {
+				count = codeSet.FailCounts[name] + 1
+			}
+		}
+		if count < hostStrikeLimit {
+			if hs.Codes[newCode] == nil {
+				hs.Codes[newCode] = &CodeNodeSet{Nodes: make(map[string]int64)}
+			}
+			codeSet := hs.Codes[newCode]
+			if codeSet.FailCounts == nil {
+				codeSet.FailCounts = make(map[string]int)
+			}
+			codeSet.FailCounts[name] = count
+			hs.LastFailure = now
+			goto saveAndReturn
+		}
 	}
 
 	if currentCode != -1 && currentCode != newCode {
@@ -1407,6 +1436,13 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			} else {
 				codeSet.FailCounts[name] = count
 			}
+		case 4, 6:
+			// the repeated strike is confirmed
+			if codeSet.FailCounts != nil {
+				delete(codeSet.FailCounts, name)
+			}
+			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+			failedBlock = true
 		default:
 			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
 		}
