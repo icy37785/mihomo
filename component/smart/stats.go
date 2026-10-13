@@ -29,7 +29,7 @@ const (
 	hostStatusRetryAfter     = 4 * time.Hour
 	hostStatusViewTTLSeconds = 30
 
-	// zero-traffic and loss need this many strikes within the window
+	// packet loss needs this many strikes within the window
 	hostStrikeWindow = 5 * time.Minute
 	hostStrikeLimit  = 2
 
@@ -100,9 +100,10 @@ type AtomicStatsRecord struct {
 }
 
 type CodeNodeSet struct {
-	Nodes      map[string]int64  `json:"nodes"`
-	FailCounts map[string]int    `json:"fail_counts,omitempty"`
-	NodeHosts  map[string]string `json:"node_hosts,omitempty"`
+	Nodes         map[string]int64  `json:"nodes"`
+	FailCounts    map[string]int    `json:"fail_counts,omitempty"`
+	Confirmations map[string]int    `json:"confirmations,omitempty"` // code 5 ladder memory
+	NodeHosts     map[string]string `json:"node_hosts,omitempty"`
 }
 
 type HostStatus struct {
@@ -304,7 +305,7 @@ func (r *AtomicStatsRecord) UploadTotal() float64 {
 	return r.uploadTotal.Load()
 }
 
-// AddUploadTotal caps the counter at 1PB (1024^5 bytes), a wrapped value would poison the model input.
+// AddUploadTotal caps the counter; a wrapped value would poison the model input.
 func (r *AtomicStatsRecord) AddUploadTotal(v float64) {
 	current := r.uploadTotal.Load()
 	const maxUpload = 1125899906842624.0
@@ -319,7 +320,7 @@ func (r *AtomicStatsRecord) DownloadTotal() float64 {
 	return r.downloadTotal.Load()
 }
 
-// AddDownloadTotal caps the counter at 1PB (1024^5 bytes).
+// AddDownloadTotal caps the counter like AddUploadTotal.
 func (r *AtomicStatsRecord) AddDownloadTotal(v float64) {
 	current := r.downloadTotal.Load()
 	const maxDownload = 1125899906842624.0
@@ -815,7 +816,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				}
 			}
 
-			// Clean up prefetch results if node stats expired, otherwise they may stay in prefetch results even if they are recovered.
+			// drop prefetch entries without stats, otherwise stale names stay listed.
 			nodeExistsMap, ok := targetNodeExistsCache[item.target]
 			if !ok {
 				nodeExistsMap = make(map[string]bool)
@@ -1113,10 +1114,8 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	return result, nil
 }
 
-// Manual blocks (code 1) and the short lived answers of a site (code 2) must not block a target,
-// otherwise a site that limits traffic would flip the target in and out of Blocked every few minutes.
 func countsTowardBlock(code int) bool {
-	return code != 1 && code != 2
+	return code != 1 && code != 2 && code != 6
 }
 
 func buildHostStatusView(codes map[int]*CodeNodeSet, now int64, hostFailLimit int) (map[string]int, bool) {
@@ -1290,7 +1289,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				}
 			}
 		}
-		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+		// the ladder memory drops once the record stays quiet for the retry window
+		if code == 5 && now-hs.LastFailure > int64(hostStatusRetryAfter.Seconds()) {
+			codeSet.Confirmations = nil
+		}
+		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0 {
 			delete(hs.Codes, code)
 		}
 	}
@@ -1310,7 +1313,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 		if codeSet.FailCounts != nil {
 			if _, ok := codeSet.FailCounts[name]; ok {
 				// a pending strike must not shadow the other codes
-				if code != 4 && code != 6 {
+				if code != 5 {
 					if currentCode == -1 || code < currentCode {
 						currentCode = code
 					}
@@ -1328,6 +1331,9 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.FailCounts != nil {
 				delete(codeSet.FailCounts, name)
 			}
+			if codeSet.Confirmations != nil {
+				delete(codeSet.Confirmations, name)
+			}
 			if codeSet.NodeHosts != nil {
 				delete(codeSet.NodeHosts, name)
 			}
@@ -1336,7 +1342,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 	}
 
 	// the first strike only counts, the second excludes the node
-	if failure && (newCode == 4 || newCode == 6) {
+	if failure && newCode == 5 {
 		count := 1
 		if oldLastFailure != 0 && now-oldLastFailure <= int64(hostStrikeWindow.Seconds()) {
 			if codeSet := hs.Codes[newCode]; codeSet != nil && codeSet.FailCounts != nil {
@@ -1388,9 +1394,11 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			codeSet.Nodes = make(map[string]int64)
 		}
 
+		excluded := ""
 		switch newCode {
 		case 1:
 			codeSet.Nodes[name] = 0 // TTL=0 means permanent
+			excluded = "permanent"
 		case 2:
 			if ttl > 0 {
 				if codeSet.FailCounts == nil {
@@ -1415,6 +1423,7 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				}
 			}
 			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+			excluded = blockTTL.String()
 			if codeSet.NodeHosts == nil {
 				codeSet.NodeHosts = make(map[string]string)
 			}
@@ -1430,21 +1439,49 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				count++
 			}
 			if count >= maxFailedTimes {
-				codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
+				codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+				excluded = blockTTL.String()
 				delete(codeSet.FailCounts, name)
 				failedBlock = true
 			} else {
 				codeSet.FailCounts[name] = count
 			}
-		case 4, 6:
-			// the repeated strike is confirmed
+		case 5:
 			if codeSet.FailCounts != nil {
 				delete(codeSet.FailCounts, name)
 			}
+			// a repeated confirmation while the node is still excluded is a no-op
+			if entry, exists := codeSet.Nodes[name]; exists && entry > now {
+				break
+			}
+			// each confirmed pair climbs the exclusion ladder, the tier survives the block
+			if codeSet.Confirmations == nil {
+				codeSet.Confirmations = make(map[string]int)
+			}
+			confirmations := codeSet.Confirmations[name] + 1
+			codeSet.Confirmations[name] = confirmations
+			// an explicit ttl (the UDP fallback) keeps its fixed block
+			if ttl <= 0 {
+				switch {
+				case confirmations == 1:
+					blockTTL = 15 * time.Minute
+				case confirmations == 2:
+					blockTTL = time.Hour
+				case confirmations == 3:
+					blockTTL = 4 * time.Hour
+				default:
+					blockTTL = HostFailureNodeTTL
+				}
+			}
 			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+			excluded = blockTTL.String()
 			failedBlock = true
 		default:
 			codeSet.Nodes[name] = time.Now().Add(blockTTL).Unix()
+			excluded = blockTTL.String()
+		}
+		if excluded != "" {
+			log.Debugln("[Smart] Node [%s] excluded for [%s] by code [%d] on target [%s]", name, excluded, newCode, wildcardTarget)
 		}
 	}
 
@@ -1465,7 +1502,7 @@ saveAndReturn:
 	}
 
 	for code, codeSet := range hs.Codes {
-		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0) {
+		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0) {
 			delete(hs.Codes, code)
 		}
 	}
@@ -1496,8 +1533,7 @@ saveAndReturn:
 	return failedBlock
 }
 
-// A code 2 entry that still runs longer than probeMaxBlockTTL was written by the version that
-// blocked the answer of a site for a whole day, and is dropped here.
+// a code 2 entry beyond probeMaxBlockTTL is stale and dropped.
 func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[string]map[string]string, error) {
 	pathPrefix := FormatDBKey(KeyTypeHostFailures, config, group)
 	dataMap, err := s.GetSubBytesByPath(pathPrefix)
@@ -1520,6 +1556,9 @@ func (s *Store) CheckHostStatus(group, config string, hostFailLimit int) (map[st
 			continue
 		}
 		wildcardTarget := fullPath[lastSlash+1:]
+		if isNetScopedTarget(wildcardTarget) {
+			continue
+		}
 
 		cachePath := FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget)
 		cacheHS, _ := hostStatusCache.GetOrStore(cachePath, func() *HostStatus { return &HostStatus{} })
@@ -1793,7 +1832,15 @@ func (s *Store) RemoveNodesData(group, config string, hostFailLimit int, nodes [
 						}
 					}
 				}
-				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+				if codeSet.Confirmations != nil {
+					for nodeName := range codeSet.Confirmations {
+						if _, toRemove := nodeSet[nodeName]; toRemove {
+							delete(codeSet.Confirmations, nodeName)
+							changed = true
+						}
+					}
+				}
+				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.Confirmations) == 0 {
 					delete(hs.Codes, code)
 				}
 			}
