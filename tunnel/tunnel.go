@@ -563,7 +563,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
-	dialMetadata := metadata
+	// Keep a DNS-mapped real IP as the outbound destination. The recovered
+	// hostname remains on metadata for routing and is restored for the tracker.
+	dialMetadata := metadata.Pure()
 	if len(metadata.Host) > 0 {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
 			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
