@@ -48,6 +48,8 @@ If Go tests fail because the sandbox cannot write the Go build cache, rerun the 
 - Trigger: this repository is a fork that tracks more than one upstream fork.
 - Primary fork remote: `upstream` -> `https://github.com/vernesong/mihomo.git`.
 - Secondary fork remote: `missuo` -> `https://github.com/missuo/mihomo.git`.
+- Additional fork remote: `qoli` -> `https://github.com/qoli/mihomo-Alpha.git`, branch `Alpha`, push URL `DISABLED`.
+- qoli integration decisions and source commits are recorded in [the upstream review](../../../docs/upstreams.md).
 - Local integration branch: `Alpha`.
 - Apply this workflow before merging code from any non-`origin` fork.
 
@@ -57,10 +59,16 @@ If Go tests fail because the sandbox cannot write the Go build cache, rerun the 
   rtk git remote add missuo https://github.com/missuo/mihomo.git
   rtk git remote set-url --push missuo DISABLED
   ```
+- Add the qoli fetch remote:
+  ```bash
+  rtk git remote add qoli https://github.com/qoli/mihomo-Alpha.git
+  rtk git remote set-url --push qoli DISABLED
+  ```
 - Refresh fork refs:
   ```bash
   rtk git fetch upstream --prune
   rtk git fetch missuo --prune
+  rtk git fetch qoli --prune --no-tags
   ```
 - Compare integration state:
   ```bash
@@ -79,17 +87,19 @@ If Go tests fail because the sandbox cannot write the Go build cache, rerun the 
 
 ### 3. Contracts
 - `origin` is the only normal push target for this fork.
-- `upstream` and `missuo` are fetch sources; do not push to them from this repository.
-- Keep the secondary upstream push URL set to `DISABLED`.
+- `upstream`, `missuo`, and `qoli` are fetch sources; do not push to them from this repository.
+- Keep every third-party upstream push URL set to `DISABLED`.
 - Track `missuo/Alpha` for mihomo code updates.
+- Review `qoli/Alpha` commit by commit. Port compatible changes with the source SHA and author preserved; its Smart behavior, release settings, and fork-specific `AGENTS.md` are not automatically applicable here.
 - Do not track `missuo/main` for this project: it has no merge base with local `Alpha` and is not the mihomo code line used here.
 - Local build artifacts such as a root-level `mihomo` executable must not be committed.
 - Prefer merge commits over rebasing `Alpha`, because `Alpha` is a shared/release branch and merge commits preserve which upstream fork supplied the change.
+- For selective ports, record accepted, superseded, reverted, and rejected commits in the upstream review rather than merging the entire fork to mark it synchronized.
 
 ### 4. Validation & Error Matrix
 | Condition | Required response |
 | --- | --- |
-| `rtk git status --short` is not clean | Stop and classify the changes before merging. Delete obvious local build artifacts only when explicitly approved. |
+| `rtk git status --short` is not clean | Stop and classify the changes before merging. Preserve pre-existing user edits and keep them out of integration commits. Isolate overlapping changes; delete local build artifacts only when explicitly approved. |
 | Remote has a push URL other than `DISABLED` for a third-party fork | Set push URL to `DISABLED` before fetch/merge work continues. |
 | Candidate branch has no merge base with `Alpha` | Do not merge it; inspect branch identity and choose another branch. |
 | `git merge-tree --write-tree Alpha <remote>/<branch>` fails with conflicts | Create a temporary integration branch and resolve conflicts there before touching `Alpha`. |
@@ -114,7 +124,7 @@ If Go tests fail because the sandbox cannot write the Go build cache, rerun the 
 - Assertion points:
   - affected-package tests pass;
   - full repository tests pass;
-  - `rtk git status --short` is clean after merge validation.
+  - after committing the integration, `rtk git status --short` is clean or contains only the recorded pre-existing user edits.
 
 ### 7. Wrong vs Correct
 #### Wrong
@@ -145,6 +155,7 @@ rtk go test ./...
 - Active standalone test entries live in `.github/workflows/test.yml` under `jobs.test.strategy.matrix.os` and `jobs.test.strategy.matrix.go-version`.
 - Docker artifact selection for `linux/amd64` lives in `docker/file-name.sh`.
 - The Docker `linux/amd64` selector must resolve to `amd64-v3`.
+- Release input is the optional string `workflow_dispatch.inputs.version`, passed to the variables script via `RELEASE_VERSION`; `GITHUB_REF_TYPE` and `GITHUB_REF_NAME` identify tag pushes.
 
 ### 3. Contracts
 - Keep inactive matrix entries commented, not deleted, so future user-requested targets can be restored deliberately.
@@ -152,6 +163,11 @@ rtk go test ./...
 - Docker platforms must match available Linux artifacts. With only `linux/amd64-v3` enabled, Docker `platforms` must only include `linux/amd64`.
 - Standalone CI tests should mirror the active self-use targets: keep `ubuntu-latest` and `macos-latest` active, keep the current default Go version active, and leave inactive OS/Go versions commented for future restoration.
 - If additional Linux architectures are re-enabled, update both the build matrix and Docker artifact selector in the same change.
+- An empty manual version on `Alpha` updates the rolling prerelease. A non-empty version must match `vX.Y.Z` with an optional suffix; a tag push uses its tag as the version.
+- Existing release tags, including peeled annotated tags, must identify the build's source commit. Release upload uses `target_commitish: ${{ github.sha }}`; it must not force-update `Meta` or repoint an existing tag.
+- Tag identity is checked during the build; this is not a lock against concurrent tag changes before publication.
+- Keep package-version lookup scoped to the current `GITHUB_REPOSITORY` rather than substituting another upstream's releases.
+- Default workflow permissions are `contents: read`; release jobs grant `contents: write`, and Docker grants `contents: read` plus `packages: write`.
 
 ### 4. Validation & Error Matrix
 | Condition | Required response |
@@ -161,11 +177,15 @@ rtk go test ./...
 | `docker/file-name.sh` selects `amd64-v1` while matrix builds `amd64-v3` | Change the selector to `amd64-v3`. |
 | `.github/workflows/test.yml` still tests disabled OS targets or old Go versions | Comment those matrix entries until the matching build targets are re-enabled. |
 | Workflow YAML parses but `actionlint` fails | Treat the workflow as invalid until `actionlint` passes. |
+| Release version is malformed or its existing tag points to another source commit | Fail the build before publishing. |
+| A release upload has no matching artifact | Fail the upload using `fail_on_unmatched_files: true`. |
 
 ### 5. Good/Base/Bad Cases
 - Good: active matrix contains only Linux `amd64-v3` and Darwin `arm64`, with all optional fields present.
 - Base: Docker builds only `linux/amd64` and `docker/file-name.sh` selects `amd64-v3`.
 - Base: standalone tests run only `ubuntu-latest` and `macos-latest` on the active default Go version.
+- Good: manual `Alpha` with an empty version updates rolling assets; `v1.2.3` publishes artifacts built from the workflow's source commit.
+- Bad: embedding `${{ inputs.version }}` directly into shell code, accepting a mismatched tag, or force-pushing `Alpha` over `Meta` during a release.
 - Bad: commenting out matrix entries but leaving Docker platforms `linux/386`, `linux/arm64`, or `linux/arm/v7` enabled.
 - Bad: limiting release builds but still running the standalone test matrix across Windows, Linux ARM, macOS Intel, and old Go versions.
 - Bad: relying on missing matrix keys to evaluate as empty strings; `actionlint` rejects this.
@@ -189,6 +209,8 @@ rtk ruby -e 'require "yaml"; YAML.load_file(".github/workflows/test.yml"); puts 
   ```bash
   rtk proxy git diff --check
   ```
+- Release script assertions: rolling/manual/tag versions, lightweight and annotated tags, mismatched tag rejection, malformed input rejection, and an unchanged build matrix/Docker platform list. See [the qoli review](../../../docs/upstreams.md) for the accepted adaptation and validation scope.
+- Run full Go suites with the release job's existing environment (`CGO_ENABLED=0 SKIP_CONCURRENT_TEST=1 SKIP_INTEROP_TEST=1`) both with and without `with_gvisor`; report any broader stress-test failures separately.
 
 ### 7. Wrong vs Correct
 #### Wrong
